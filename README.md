@@ -1,173 +1,104 @@
-# Deep learning GPU development environment
+# Oak Defect Detection
 
-A ready-to-use deep learning environment with NVIDIA GPU support for VS Code. Includes both **PyTorch** and **TensorFlow** frameworks. Designed for cross-platform support and wide GPU compatibility.
+A GPU‑accelerated deep learning project for semantic segmentation of defects in green rough oak planks. The workflow cleans and standardizes line‑scan data, builds multi‑class masks, trains a ResNet34‑UNet model, and evaluates with IoU, F1, accuracy, ROC curves, and confusion matrices.
 
-## What's included
+## Deep learning GPU environment
 
-| Category | Versions |
-|----------|----------|
-| **GPU** | CUDA 12.5, cuDNN 9.1 |
-| **ML** | PyTorch 2.10, TensorFlow 2.16, Keras 3.3, Scikit-learn 1.4 |
-| **Python** | Python 3.10, NumPy 1.24, Pandas 2.2, Matplotlib 3.10 |
-| **Tools** | JupyterLab, TensorBoard, Optuna |
+This repository is designed to run inside a VS Code dev container with NVIDIA GPU support.
+
+**Included stack (reference)**  
+- CUDA 12.5, cuDNN 9.1  
+- PyTorch 2.10, TensorFlow 2.16, Keras 3.3, scikit‑learn 1.4  
+- Python 3.10, NumPy 1.24, Pandas 2.2, Matplotlib 3.10  
+- JupyterLab, TensorBoard, Optuna  
 
 Based on [NVIDIA's TensorFlow 24.06 container](https://docs.nvidia.com/deeplearning/frameworks/tensorflow-release-notes/rel-24-06.html).
 
-> **No NVIDIA GPU?** Use the CPU version instead: [gperdrizet/deeplearning-CPU](https://github.com/gperdrizet/deeplearning-CPU)
+**Requirements**  
+- NVIDIA GPU (Pascal or newer) with driver ≥545  
+- Docker with GPU support  
+- VS Code with the Dev Containers extension  
+
+Linux users should also install the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
 
 ## Project structure
 
 ```
-tensorflow-GPU/
-├── .devcontainer/
-│   └── devcontainer.json       # Dev container configuration
-├── data/                       # Store datasets here
-├── logs/                       # TensorBoard logs
-├── models/                     # Saved model files
-├── notebooks/
-│   ├── environment_test.ipynb  # Verify your setup
-│   └── functions/              # Helper modules for notebooks
+Oak-Defect-Detection/
+├── .devcontainer/               # Dev container configuration
+├── data/                        # Raw, filtered, and organized datasets
+├── logs/                        # TensorBoard logs
+├── models/                      # Saved model files
+├── notebooks/                   # Training, evaluation, experiments
+│   ├── functions/               # Custom helper modules
+│   └── Unet_FullImage.ipynb      # Full-image UNet training pipeline
 ├── .gitignore
 ├── LICENSE
 └── README.md
 ```
 
-## Requirements
+## Oak defect detection workflow (high level)
 
-- **NVIDIA GPU** (Pascal or newer) with driver ≥545
-- **Docker** with GPU support ([Windows](https://docs.docker.com/desktop/setup/install/windows-install) | [Linux](https://docs.docker.com/desktop/setup/install/linux))
-- **VS Code** with the [Dev Containers extension](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers)
+1. **Data audit and normalization**  
+   Analyze raw line‑scan imagery and normalize defect class naming.
 
-> **Linux users:** Also install the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
+2. **Class filtering**  
+   Move rare classes below a mask-count threshold to reduce imbalance.
 
-### GPU compatibility
+3. **Reorganization and validation**  
+   Align images/masks, validate samples, and quarantine invalid data.
 
-This environment requires an NVIDIA GPU with **compute capability 6.0+** (Pascal architecture or newer):
+4. **Mask composition**  
+   Merge per‑class masks into a single multi‑class mask per image.
 
-| Architecture | Example GPUs | Compute Capability |
-|--------------|--------------|-------------------|
-| Pascal | GTX 1050–1080, Tesla P100 | 6.0–6.1 |
-| Volta | Tesla V100, Titan V | 7.0 |
-| Turing | RTX 2060–2080, GTX 1660 | 7.5 |
-| Ampere | RTX 3060–3090, A100 | 8.0–8.6 |
-| Ada Lovelace | RTX 4060–4090 | 8.9 |
-| Hopper | H100, H200 | 9.0 |
-| Blackwell | RTX 5070–5090, B100, B200 | 10.0 |
+5. **Train/val/test split**  
+   Persist split metadata for repeatable experiments.
 
-Check your GPU's compute capability: [NVIDIA CUDA GPUs](https://developer.nvidia.com/cuda-gpus)
+6. **Model training**  
+   Train a ResNet34‑UNet with Albumentations augmentations and TensorBoard logging.
 
-> **Note:** This environment is configured for broad GPU compatibility, supporting Pascal and newer architectures. If you have a more recent GPU (e.g. Ada Lovelace, Hopper, or Blackwell), you may benefit from using a newer CUDA version to access the latest performance optimizations and features. Consider setting up a custom environment with an updated [NVIDIA TensorFlow container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/tensorflow) to take full advantage of your hardware.
+7. **Evaluation**  
+   Select best checkpoint by validation IoU, then compute test metrics:
+   mean IoU, F1, accuracy, ROC curves, and confusion matrix.
 
-## Quick start
+## Custom functions
 
-To quickly try the container environment out on your system do the following. If you want to use it for your own project, see below.
+Notebook pipelines use project‑specific utilities from `notebooks/functions`, including:
+- `analyze_dataset`, `reorganize_dataset`, `validate_dataset`, `move_invalid_samples`
+- `create_combined_masks`, `create_train_val_split`
+- `rename_defect_files`, `filter_classes_by_mask_count`
 
-1. **Fork** this repository (click "Fork" button above)
+These make the preprocessing steps repeatable and reduce manual error.
 
-2. **Clone** your fork:
-   ```bash
-   git clone https://github.com/<your-username>/deeplearning-GPU.git
-   ```
+## Data layout (expected)
 
-3. **Open VS Code**
-
-4. **Open Folder in Container** from the VS Code command pallet (Ctrl+shift+p), start typing `Open Folder in`...
-
-5. **Verify** by running `notebooks/environment_test.ipynb`
-
-## Using as a template for new projects
-
-You can use your fork as a template to quickly create new deep learning projects:
-
-### One-time setup: Make your fork a template
-
-1. Go to your fork on GitHub
-2. Click **Settings** → scroll to **Template repository**
-3. Check the box to enable it
-
-### Creating a new project from your template
-
-1. Go to your fork on GitHub
-2. Click the green **Use this template** button → **Create a new repository**
-3. Enter your new repository name and settings
-4. Click **Create repository**
-5. **Clone** your new repository:
-   ```bash
-   git clone https://github.com/<your-username>/my-new-project.git
-   ```
-6. **Clean up** (optional): Remove the example notebooks, then add your own code:
-   ```bash
-   rm -rf notebooks/*.ipynb
-   git add -A && git commit -m "Initial project setup"
-   git push
-   ```
-
-Now you have a fresh deep learning GPU project with the dev container configuration ready to go!
-
-## Adding Python packages
-
-### Using pip directly
-
-Install packages in the container terminal:
-
-```bash
-pip install <package-name>
+```
+data/
+├── raw-data/                    # Raw line-scan output
+├── filtered-data/               # Removed/rare/invalid samples
+└── organized-data/
+    ├── images/                  # RGB images
+    ├── combined_masks/          # Multi-class masks
+    └── split.json               # Train/val/test split
 ```
 
-> **Note:** Packages installed this way will be lost when the container is rebuilt.
+## How to run
 
-### Using requirements.txt (Recommended)
+1. Open the repository in a VS Code dev container.  
+2. Run `notebooks/Unet_FullImage.ipynb` from top to bottom.  
+3. Check TensorBoard logs in `logs/` and saved models in `models/`.
 
-For persistent packages that survive container rebuilds:
+## Metrics reported
 
-1. **Create** a `requirements.txt` file in the repository root:
-   ```
-   scikit-image==0.22.0
-   plotly
-   ```
+- Mean IoU (per‑class and averaged)
+- F1 score (per‑class and macro)
+- Accuracy (pixel‑level)
+- ROC curves (one‑vs‑rest)
+- Confusion matrix (percentage‑normalized)
 
-2. **Update** `.devcontainer/devcontainer.json` to install packages on container creation by adding a `postCreateCommand`:
-   ```json
-   "postCreateCommand": "pip install -r requirements.txt"
-   ```
+## Notes
 
-3. **Rebuild** the container (`F1` → "Dev Containers: Rebuild Container")
-
-Now your packages will be automatically installed whenever the container is created.
-
-## TensorBoard
-
-To launch TensorBoard:
-
-1. Open the command palette (`Ctrl+Shift+P` / `Cmd+Shift+P`)
-2. Run **Python: Launch TensorBoard**
-3. Select the `logs/` directory when prompted
-
-TensorBoard will open in a new tab within VS Code. Place your training logs in the `logs/` directory.
-
-## Optuna dashboard
-
-Access the Optuna dashboard by right clicking on your Optuna database file and selecting 'Open in Optuna Dashboard'.
-
-> Note: the default ports for TensorBoard and Optuna are published by the container, so you can also run them via their respective built in web servers and they will be avalible on the host's localhost.
-
-## Keeping your fork updated
-
-```bash
-# Add upstream (once)
-git remote add upstream https://github.com/gperdrizet/deeplearning-GPU.git
-
-# Sync
-git fetch upstream
-git merge upstream/main
-```
-
-## Troubleshooting
-
-| Problem | Solution |
-|---------|----------|
-| Docker won't start | Enable virtualization in BIOS |
-| Permission denied (Linux) | Add user to docker group, then log out/in |
-| GPU not detected | Update NVIDIA drivers (≥545) |
-| Container build fails | Check internet connection |
+- Model checkpoints are stored under `checkpoints/` during training.  
+- The best checkpoint is saved to `models/` for test inference.  
+- Update class mappings and thresholds as new defect classes are added.
 
