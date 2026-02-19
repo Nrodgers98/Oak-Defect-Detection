@@ -3,17 +3,19 @@ from pathlib import Path
 from collections import defaultdict
 
 
-def filter_classes_by_mask_count(source_folder: str, mask_threshold: int = 50, output_folder: str = None) -> dict:
+def filter_classes_by_mask_count(source_folder: str = None, mask_threshold: int = 50, output_folder: str = None) -> dict:
     """
-    Copy classes with MORE than a certain number of masks to a filtered data folder,
-    along with their associated color images.
+    Copy color masks (_Col_Bin_) from classes with count >= threshold from raw-data into filtered-data,
+    along with their associated color images. Only processes color masks, excluding luminance masks (_Lum_Bin_).
+    All files are copied to a flat structure (no subfolders) in filtered-data.
     
     Args:
-        source_folder: Path to source directory containing mask files
-        mask_threshold: Maximum number of masks to filter (default 50).
-                       Classes with MORE masks will be copied to filtered-data.
-        output_folder: Path to destination folder for filtered classes.
-                      Defaults to /data/filtered-data
+        source_folder: Path to source directory containing mask files.
+                      Defaults to ../data/raw-data relative to this file.
+        mask_threshold: Minimum number of masks to filter (default 50).
+                       Classes with count >= threshold will be copied to filtered-data.
+        output_folder: Path to destination folder for filtered masks/images.
+                      Defaults to ../data/filtered-data relative to source_folder.
     
     Returns:
         Dictionary with filtering results:
@@ -25,7 +27,11 @@ def filter_classes_by_mask_count(source_folder: str, mask_threshold: int = 50, o
             'color_images_copied': int
         }
     """
-    source_path = Path(source_folder)
+    if source_folder is None:
+        # Default to raw-data directory
+        source_path = Path(__file__).parent.parent.parent / "data" / "raw-data"
+    else:
+        source_path = Path(source_folder)
     
     if not source_path.exists():
         raise FileNotFoundError(f"Source folder not found: {source_path}")
@@ -38,6 +44,12 @@ def filter_classes_by_mask_count(source_folder: str, mask_threshold: int = 50, o
     # Create output folder
     output_folder.mkdir(parents=True, exist_ok=True)
     
+    def extract_timestamp(filename: str) -> str:
+        parts = filename.split("_")
+        if len(parts) < 2:
+            return ""
+        return parts[0] + "_" + parts[1]
+
     # Count masks by class
     masks_by_class = defaultdict(list)
     images_by_timestamp = defaultdict(list)  # Track color images for syncing
@@ -46,11 +58,11 @@ def filter_classes_by_mask_count(source_folder: str, mask_threshold: int = 50, o
         filename = file.name
         
         # Extract timestamp (e.g., "1-29-26_3.28.48.206" from full filename)
-        timestamp = filename.split("_")[0] + "_" + "_".join(filename.split("_")[1:3])
+        timestamp = extract_timestamp(filename)
         
-        if "_Bin_" in filename:
-            # Extract class name from mask files
-            class_name = filename.split("_Bin_")[1].replace(".tif", "")
+        if "_Col_Bin_" in filename and "_Lum_Bin_" not in filename:
+            # Extract class name from color mask files (exclude luminance masks)
+            class_name = filename.split("_Col_Bin_")[1].replace(".tif", "")
             masks_by_class[class_name].append(filename)
         elif "_Col.tif" in filename:
             # Track color images by timestamp
@@ -81,22 +93,19 @@ def filter_classes_by_mask_count(source_folder: str, mask_threshold: int = 50, o
     
     # Copy files from classes meeting threshold
     for class_name, files in classes_to_move.items():
-        class_output_dir = output_folder / class_name
-        class_output_dir.mkdir(parents=True, exist_ok=True)
-        
         # Copy mask files and track timestamps
         timestamps_to_copy = set()
         for filename in files:
             src = source_path / filename
-            dst = class_output_dir / filename
+            dst = output_folder / filename
             try:
                 shutil.copy2(str(src), str(dst))
                 files_moved[class_name] += 1
                 
                 # Extract timestamp for color image matching
-                parts = filename.split("_")
-                timestamp = parts[0] + "_" + parts[1]
-                timestamps_to_copy.add(timestamp)
+                timestamp = extract_timestamp(filename)
+                if timestamp:
+                    timestamps_to_copy.add(timestamp)
             except Exception as e:
                 print(f"Error copying {filename}: {e}")
         
@@ -105,7 +114,7 @@ def filter_classes_by_mask_count(source_folder: str, mask_threshold: int = 50, o
             for color_img in images_by_timestamp[timestamp]:
                 if color_img not in copied_images:
                     src = source_path / color_img
-                    dst = class_output_dir / color_img
+                    dst = output_folder / color_img
                     try:
                         shutil.copy2(str(src), str(dst))
                         copied_images.add(color_img)
@@ -146,10 +155,8 @@ def filter_classes_by_mask_count(source_folder: str, mask_threshold: int = 50, o
 
 
 if __name__ == "__main__":
-    # Default usage
-    source_folder = "../data/output_scv2"
+    # Default usage - scans raw-data by default
     result = filter_classes_by_mask_count(
-        source_folder=source_folder,
         mask_threshold=50
     )
     print("\nFiltering complete!")

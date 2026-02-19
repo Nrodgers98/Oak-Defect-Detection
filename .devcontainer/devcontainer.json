@@ -15,7 +15,9 @@
 		"--ulimit", "stack=67108864", // Increase process stack limit to 64 MB
 		"--publish", "6006:6006",     // Map TensorBoard port for easy access
 		"--publish", "8080:8080",     // Map Optuna port for easy access
-		"--network=bridge"            // Explicitly use bridge network for internet access
+		"--publish", "8501:8501",     // Map Streamlit port for easy access
+		"--network=bridge",            // Explicitly use bridge network for internet access
+		"--dns=8.8.8.8"               // Use Google's public DNS for internet access
 	],
 	"remoteUser": "vscode",           // Use the 'vscode' user provided by the base image
 	"containerEnv": {
@@ -66,7 +68,7 @@
 	"onCreateCommand": "",
 
 	// Use 'postCreateCommand' to run commands once after the container is created
-	"postCreateCommand": "mkdir -p logs && mkdir -p models && mkdir -p data",
+	"postCreateCommand": "mkdir -p logs && mkdir -p models && mkdir -p data && pip install --user segmentation-models-pytorch 'opencv-python-headless<4.10' streamlit 'typing_extensions>=4.14.1' albumentations && pip install --user --force-reinstall --no-deps 'numpy<2'",
 
 	// Use 'postAttachCommand' to run TensorBoard
 	"postAttachCommand": ""

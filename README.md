@@ -11,6 +11,7 @@ This repository is designed to run inside a VS Code dev container with NVIDIA GP
 - PyTorch 2.10, TensorFlow 2.16, Keras 3.3, scikit‑learn 1.4  
 - Python 3.10, NumPy 1.24, Pandas 2.2, Matplotlib 3.10  
 - JupyterLab, TensorBoard, Optuna  
+- segmentation_models_pytorch, Albumentations, OpenCV, Streamlit  
 
 Based on [NVIDIA's TensorFlow 24.06 container](https://docs.nvidia.com/deeplearning/frameworks/tensorflow-release-notes/rel-24-06.html).
 
@@ -31,7 +32,11 @@ Oak-Defect-Detection/
 ├── models/                      # Saved model files
 ├── notebooks/                   # Training, evaluation, experiments
 │   ├── functions/               # Custom helper modules
-│   └── Unet_FullImage.ipynb      # Full-image UNet training pipeline
+│   ├── Unet_FullImage.ipynb     # Full-image UNet training pipeline
+│   ├── Unet_FullImage Optuna.ipynb  # Hyperparameter optimization with Optuna
+│   ├── Unet_Patches.ipynb       # Patch-based UNet training pipeline
+│   ├── environment_test.ipynb  # Environment verification and GPU testing
+│   └── app.py        # Interactive web app for model inference
 ├── .gitignore
 ├── LICENSE
 └── README.md
@@ -70,6 +75,22 @@ Notebook pipelines use project‑specific utilities from `notebooks/functions`, 
 
 These make the preprocessing steps repeatable and reduce manual error.
 
+## Key libraries
+
+| Library | Purpose | Notes |
+| --- | --- | --- |
+| PyTorch | Training, inference, dataloaders | Core deep learning framework and CUDA support |
+| segmentation_models_pytorch | UNet + encoder zoo | Provides ResNet34‑UNet and pretrained encoders |
+| Albumentations | Augmentations + normalization | Fast, flexible image transforms for segmentation |
+| OpenCV | Image utilities | Used for file I/O and preprocessing support |
+| NumPy | Array ops | Efficient tensor/array manipulation |
+| Pillow | Image reading | Handles TIFF/PNG image loading |
+| scikit‑learn | Metrics | ROC, F1, accuracy, confusion matrix |
+| Matplotlib | Plotting | Curves and confusion matrix visualization |
+| TensorBoard | Logging | Visual tracking of training metrics |
+| Optuna | Hyperparameter optimization | Automated hyperparameter tuning with TPE sampler |
+| Streamlit | Web interface | Interactive app for model inference and visualization |
+
 ## Data layout (expected)
 
 ```
@@ -84,9 +105,46 @@ data/
 
 ## How to run
 
+### Training notebooks
+
 1. Open the repository in a VS Code dev container.  
-2. Run `notebooks/Unet_FullImage.ipynb` from top to bottom.  
+2. Run one of the training notebooks from top to bottom:
+   - `notebooks/Unet_FullImage.ipynb` — Full-image UNet training
+   - `notebooks/Unet_FullImage Optuna.ipynb` — Hyperparameter optimization
+   - `notebooks/Unet_Patches.ipynb` — Patch-based UNet training
 3. Check TensorBoard logs in `logs/` and saved models in `models/`.
+
+### Exporting models to ONNX (for lightweight inference)
+
+After training, you can export any trained PyTorch model to ONNX format for faster inference. Each training notebook includes an ONNX export code block at the end that saves models to `models/onnx/`. Simply run the export cell after training completes to generate the `.onnx` file.
+
+### Streamlit inference app
+
+Run the interactive web app for model inference:
+
+```bash
+streamlit run notebooks/app.py
+```
+
+The app will open at `http://localhost:8501` and allows you to:
+- Select trained models from `models/`
+- Choose images from `data/organized-data/images/`
+- Generate and visualize prediction masks in real-time
+- Adjust overlay transparency and inference settings
+
+#### Backend selection: PyTorch vs ONNX
+
+The Streamlit app can run models with either **PyTorch** or **ONNX Runtime**:
+
+- **Model Backend (sidebar)**: choose between:
+  - **PyTorch (.pt/.pth)**: runs checkpoints saved under `models/` (excluding `models/onnx/`).
+  - **ONNX (.onnx)**: runs ONNX exports saved under `models/onnx/` using ONNX Runtime.
+- **Model picker behavior**:
+  - When PyTorch is selected, the model dropdown lists only `.pt` / `.pth` files.
+  - When ONNX is selected, the model dropdown lists only `.onnx` files from `models/onnx/`.
+- The rest of the UI (image selection, overlays, class distributions) works identically for both backends.
+
+See `STREAMLIT_README.md` for detailed usage instructions.
 
 ## Metrics reported
 
