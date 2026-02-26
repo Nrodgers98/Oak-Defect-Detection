@@ -68,7 +68,7 @@
 	"onCreateCommand": "",
 
 	// Use 'postCreateCommand' to run commands once after the container is created
-	"postCreateCommand": "mkdir -p logs && mkdir -p models && mkdir -p data && pip install --user segmentation-models-pytorch 'opencv-python-headless<4.10' streamlit 'typing_extensions>=4.14.1' albumentations && pip install --user --force-reinstall --no-deps 'numpy<2'",
+	"postCreateCommand": "mkdir -p logs && mkdir -p models && mkdir -p data",
 
 	// Use 'postAttachCommand' to run TensorBoard
 	"postAttachCommand": ""
