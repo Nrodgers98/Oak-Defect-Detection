@@ -9,7 +9,6 @@ tqdm==4.67.3
 albucore==0.0.24
 albumentations==2.0.8
 segmentation_models_pytorch==0.5.0
-ultralytics>=8.1.0
 
 torch==2.10.0
 torchvision==0.25.0

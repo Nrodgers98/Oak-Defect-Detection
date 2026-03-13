@@ -68,7 +68,7 @@
 	"onCreateCommand": "",
 
 	// Use 'postCreateCommand' to run commands once after the container is created
-	"postCreateCommand": "mkdir -p logs && mkdir -p models && mkdir -p data && pip install -r requirements.txt",
+	"postCreateCommand": "mkdir -p logs && mkdir -p models && mkdir -p data && mkdir -p checkpoints && pip install -r requirements.txt && pip install --no-deps ultralytics==8.4.21",
 
 	// Use 'postAttachCommand' to run TensorBoard
 	"postAttachCommand": ""
