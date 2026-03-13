@@ -208,21 +208,46 @@ def get_onnx_session(model_path: str):
 
 
 def predict_with_onnx(image_path: str, onnx_model_path: str):
-    # Reuse existing helpers; keep tensor on CPU for ONNX Runtime
-    image = load_image(image_path)
-    img_tensor = pred_module.preprocess_image(image, device="cpu")
-    inputs = img_tensor.numpy()  # [1, 3, H, W]
-    
+    """
+    Run inference with an ONNX model.
+
+    Supports two ONNX model formats:
+    - **EBI-compliant** (input name "image", uint8 input, output = 0-100% scores):
+      The ONNX graph handles preprocessing (uint8→float32, /255, ImageNet norm)
+      and postprocessing (softmax, ×100) internally. We just feed the raw image.
+    - **Legacy** (input name "input", float32 input, output = raw logits):
+      We preprocess externally and apply softmax+argmax after inference.
+    """
     session = get_onnx_session(onnx_model_path)
-    input_name = session.get_inputs()[0].name
-    outputs = session.run(None, {input_name: inputs})[0]  # [1, C, H, W]
-    
-    # Softmax + argmax in NumPy
-    logits = outputs
-    logits = logits - logits.max(axis=1, keepdims=True)
-    exp_logits = np.exp(logits)
-    probs = exp_logits / exp_logits.sum(axis=1, keepdims=True)
-    pred = probs.argmax(axis=1)[0].astype(np.uint8)
+    inp_meta = session.get_inputs()[0]
+    input_name = inp_meta.name
+
+    # Load image as RGB numpy array [H, W, 3] uint8
+    image = load_image(image_path)
+
+    if input_name == "image":
+        # ── EBI-compliant model: uint8 [B, 3, H, W] ─────────
+        # Transpose HWC → CHW and add batch dim
+        img_chw = np.transpose(image, (2, 0, 1))[np.newaxis, ...]  # [1, 3, H, W]
+        img_input = img_chw.astype(np.uint8)
+
+        outputs = session.run(None, {input_name: img_input})[0]  # [1, C, H, W]
+        # Output is already 0-100% softmax scores; argmax gives class label
+        pred = outputs.argmax(axis=1)[0].astype(np.uint8)
+    else:
+        # ── Legacy model: float32 preprocessed input ─────────
+        img_tensor = pred_module.preprocess_image(image, device="cpu")
+        inputs = img_tensor.numpy()  # [1, 3, H, W]
+
+        outputs = session.run(None, {input_name: inputs})[0]  # [1, C, H, W]
+
+        # Softmax + argmax in NumPy
+        logits = outputs
+        logits = logits - logits.max(axis=1, keepdims=True)
+        exp_logits = np.exp(logits)
+        probs = exp_logits / exp_logits.sum(axis=1, keepdims=True)
+        pred = probs.argmax(axis=1)[0].astype(np.uint8)
+
     return pred
 
 
