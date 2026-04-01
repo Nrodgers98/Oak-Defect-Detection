@@ -5,3 +5,10 @@ logs
 models
 checkpoints
 .venv
+.vs
+
+
+# Models
+*.onnx
+*.pt
+
