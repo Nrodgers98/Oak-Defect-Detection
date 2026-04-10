@@ -31,7 +31,7 @@ Oak-Defect-Detection/
 ├── logs/                        # TensorBoard logs
 ├── models/                      # Saved model files
 ├── notebooks/                   # Training, evaluation, experiments
-│   ├── functions/               # Custom helper modules
+│   ├── functions/               # Custom helper modules (incl. ``oak_hf_dataset.py``)
 │   ├── Unet_FullImage.ipynb     # Full-image UNet training pipeline
 │   ├── Unet_FullImage Optuna.ipynb  # Hyperparameter optimization with Optuna
 │   ├── Unet_Patches.ipynb       # Patch-based UNet training pipeline
@@ -72,6 +72,7 @@ Notebook pipelines use project‑specific utilities from `notebooks/functions`, 
 - `analyze_dataset`, `reorganize_dataset`, `validate_dataset`, `move_invalid_samples`
 - `create_combined_masks`, `create_train_val_split`
 - `rename_defect_files`, `filter_classes_by_mask_count`
+- `oak_hf_dataset.ensure_oak_raw_data` — fetch published TIFFs from Hugging Face into `data/raw-data`
 
 These make the preprocessing steps repeatable and reduce manual error.
 
@@ -90,6 +91,7 @@ These make the preprocessing steps repeatable and reduce manual error.
 | TensorBoard | Logging | Visual tracking of training metrics |
 | Optuna | Hyperparameter optimization | Automated hyperparameter tuning with TPE sampler |
 | Streamlit | Web interface | Interactive app for model inference and visualization |
+| huggingface_hub | Dataset download | Pulls `nrodgers98/Oak-Defect-Detection` into `data/raw-data` |
 
 ## Data layout (expected)
 
@@ -102,6 +104,41 @@ data/
     ├── combined_masks/          # Multi-class masks
     └── split.json               # Train/val/test split
 ```
+
+## Public dataset (Hugging Face)
+
+The project’s raw line-scan TIFFs are published as **[nrodgers98/Oak-Defect-Detection](https://huggingface.co/datasets/nrodgers98/Oak-Defect-Detection)** on Hugging Face (image segmentation, ~1.5k samples, CC BY-NC 4.0). The repo stores files under a `raw-data/` tree using the same `*_Col.tif` / `*_Col_Bin_<Class>.tif` naming used by the preprocessing pipeline.
+
+### Populate `data/raw-data` from the Hub
+
+Install dependencies (includes `huggingface_hub`; see `requirements.txt`), then either:
+
+**Option A — from a notebook** (run before `prepare_dataset`):
+
+```python
+from functions.oak_hf_dataset import ensure_oak_raw_data
+from functions.data_pipeline import prepare_dataset
+
+RAW_DIR = ensure_oak_raw_data()  # downloads once; skips if *.tif already present
+DATA_ROOT, class_mapping = prepare_dataset(raw_data_folder=str(RAW_DIR))
+```
+
+**Option B — command line** from the repository root:
+
+```bash
+python notebooks/functions/oak_hf_dataset.py
+```
+
+Use `python notebooks/functions/oak_hf_dataset.py --force` to replace existing `data/raw-data/*.tif` with a fresh copy from the Hub. Set `HF_TOKEN` if you need higher rate limits or access to a private fork.
+
+**Option C — `datasets` API** (loads an `Image` column; useful for exploration, not a drop-in for the TIFF pipeline):
+
+```python
+from datasets import load_dataset
+ds = load_dataset("nrodgers98/Oak-Defect-Detection", split="train")
+```
+
+For training with this repository’s notebooks, Option A is recommended so `prepare_dataset` receives the on-disk TIFF layout it expects.
 
 ## How to run
 

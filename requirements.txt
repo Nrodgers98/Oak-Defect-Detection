@@ -21,3 +21,5 @@ onnxscript>=0.1.14
 onnxruntime-gpu==1.23.2
 streamlit==1.54.0
 
+huggingface_hub>=0.24.0
+

@@ -58,7 +58,8 @@
 		  "ms-toolsai.jupyter",                     // Jupyter notebook support for interactive data science
 		  "streetsidesoftware.code-spell-checker",  // Spell checking for code and documentation
 		  "ms-toolsai.tensorboard",                 // TensorBoard extension
-		  "optuna.optuna-dashboard"                 // Optuna dashbooard extension
+		  "optuna.optuna-dashboard",                 // Optuna dashbooard extension
+		  "marp-team.marp-vscode"                   // Marp VS Code extension
 		]
 	  }
 	},
