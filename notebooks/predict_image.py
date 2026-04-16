@@ -85,7 +85,7 @@ def preprocess_image(image: np.ndarray, mean: np.ndarray = DEFAULT_MEAN,
     return img_tensor
 
 
-def load_model(model_path: Union[str, Path], num_classes: Optional[int] = None, 
+def load_model(model_path: Union[str, Path], num_classes: Optional[int] = None,
                encoder_name: str = 'resnet34', device: str = 'cuda') -> torch.nn.Module:
     """
     Load a trained UNet model from checkpoint.
@@ -101,6 +101,10 @@ def load_model(model_path: Union[str, Path], num_classes: Optional[int] = None,
     """
     device = device if torch.cuda.is_available() and 'cuda' in device else 'cpu'
     
+    # Normalize path to string for architecture heuristics
+    model_path = Path(model_path)
+    model_path_str = str(model_path).lower()
+
     # Load checkpoint first to inspect it
     checkpoint = torch.load(model_path, map_location=device, weights_only=False)
     
@@ -136,13 +140,44 @@ def load_model(model_path: Union[str, Path], num_classes: Optional[int] = None,
             print("Warning: Could not auto-detect num_classes, using default of 4")
             num_classes = 4
     
+    # Choose architecture based on model path / checkpoint metadata
+    arch: str = "unet"
+
+    # Heuristic based on folder / file name
+    if "deeplab" in model_path_str or "deep_lab" in model_path_str:
+        arch = "deeplabv3"
+    elif "unetplusplus" in model_path_str or "unet_plus_plus" in model_path_str or "unet++" in model_path_str:
+        arch = "unet++"
+    elif "unet" in model_path_str:
+        arch = "unet"
+
+    # Allow explicit architecture hint from checkpoint if present
+    if isinstance(checkpoint, dict) and "arch" in checkpoint:
+        arch = str(checkpoint["arch"]).lower()
+
     # Create model architecture with detected/provided num_classes
-    model = smp.Unet(
-        encoder_name=encoder_name,
-        encoder_weights=None,  # We're loading trained weights
-        in_channels=3,
-        classes=num_classes
-    )
+    if arch in ("deeplabv3", "deeplab", "deeplab_v3"):
+        model = smp.DeepLabV3(
+            encoder_name=encoder_name,
+            encoder_weights=None,
+            in_channels=3,
+            classes=num_classes,
+        )
+    elif arch in ("unet++", "unetplusplus", "unet_plus_plus"):
+        model = smp.UnetPlusPlus(
+            encoder_name=encoder_name,
+            encoder_weights=None,
+            in_channels=3,
+            classes=num_classes,
+        )
+    else:
+        # Default: plain UNet
+        model = smp.Unet(
+            encoder_name=encoder_name,
+            encoder_weights=None,  # We're loading trained weights
+            in_channels=3,
+            classes=num_classes,
+        )
     
     # Load the state_dict
     model.load_state_dict(state_dict)
@@ -174,17 +209,42 @@ def predict_full_image(model: torch.nn.Module, image: np.ndarray,
     device = device if torch.cuda.is_available() and 'cuda' in device else 'cpu'
     
     # Preprocess image
-    img_tensor = preprocess_image(image, mean=mean, std=std, device=device)
+    img = image
+    orig_h, orig_w = img.shape[:2]
+
+    # Many encoder/decoder stacks require H and W to be divisible by 32 (5 pooling levels).
+    # Automatically pad up to the nearest multiple of 32 to avoid runtime errors,
+    # then crop predictions back down to the original size.
+    align = 32
+    pad_h = (align - orig_h % align) % align
+    pad_w = (align - orig_w % align) % align
+
+    if pad_h or pad_w:
+        img = cv2.copyMakeBorder(
+            img,
+            top=0,
+            bottom=pad_h,
+            left=0,
+            right=pad_w,
+            borderType=cv2.BORDER_REFLECT_101,
+        )
+
+    img_tensor = preprocess_image(img, mean=mean, std=std, device=device)
     
     # Run inference
     with torch.no_grad():
-        output = model(img_tensor)  # [1, C, H, W]
+        output = model(img_tensor)  # [1, C, H_pad, W_pad]
         probs = torch.nn.functional.softmax(output, dim=1)
         pred = torch.argmax(probs, dim=1).squeeze(0)
     
     # Convert to numpy
     pred_mask = pred.cpu().numpy().astype(np.uint8)
     prob_map = probs.squeeze(0).cpu().numpy().astype(np.float32)
+
+    # Crop back to original size if we padded
+    if pad_h or pad_w:
+        pred_mask = pred_mask[:orig_h, :orig_w]
+        prob_map = prob_map[:, :orig_h, :orig_w]
     
     return pred_mask, prob_map
 

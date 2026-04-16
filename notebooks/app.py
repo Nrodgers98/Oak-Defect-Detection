@@ -42,7 +42,10 @@ project_root = script_dir.parent if script_dir.name == "notebooks" else Path.cwd
 
 # Paths
 models_dir = project_root / "models"
-images_dir = project_root / "data" / "organized-data" / "images"
+default_images_dir = project_root / "data" / "organized-data" / "images"
+# Default directory for demo boards to predict
+default_to_predict_dir = project_root / "data" / "to_predict"
+images_dir = default_images_dir
 
 # Sidebar for settings
 with st.sidebar:
@@ -75,6 +78,32 @@ with st.sidebar:
         st.warning("ONNX Runtime is not installed. Falling back to PyTorch backend.")
         backend = "PyTorch (.pt/.pth)"
     
+    # Image directory selection
+    st.subheader("Image Directory")
+    image_dir_mode = st.radio(
+        "Image source",
+        options=["Organized dataset", "Demo boards (to_predict)", "Custom path"],
+        index=1,
+        help="Choose where to load images from.",
+    )
+    if image_dir_mode == "Organized dataset":
+        images_dir = default_images_dir
+    elif image_dir_mode == "Demo boards (to_predict)":
+        images_dir = default_to_predict_dir
+    else:
+        custom_dir_str = st.text_input(
+            "Custom image directory",
+            value=str(default_to_predict_dir),
+            help="Enter an absolute or project-relative path containing images.",
+        )
+        # Interpret relative paths as relative to project root
+        custom_path = Path(custom_dir_str)
+        if not custom_path.is_absolute():
+            custom_path = project_root / custom_path
+        images_dir = custom_path
+
+    st.caption(f"Current image directory: `{images_dir}`")
+
     # Overlay transparency
     alpha = st.slider(
         "Overlay Transparency",
@@ -211,42 +240,51 @@ def predict_with_onnx(image_path: str, onnx_model_path: str):
     """
     Run inference with an ONNX model.
 
-    Supports two ONNX model formats:
-    - **EBI-compliant** (input name "image", uint8 input, output = 0-100% scores):
-      The ONNX graph handles preprocessing (uint8→float32, /255, ImageNet norm)
-      and postprocessing (softmax, ×100) internally. We just feed the raw image.
-    - **Legacy** (input name "input", float32 input, output = raw logits):
-      We preprocess externally and apply softmax+argmax after inference.
+    Supports two ONNX model formats (chosen from the first input's declared type,
+    not only the tensor name):
+    - **Graph-internal preprocessing** (ONNX input type ``tensor(uint8)``):
+      Feed raw RGB pixels as ``uint8`` NCHW ``[1, 3, H, W]``. The graph may
+      handle normalization / softmax internally.
+    - **External preprocessing** (input type ``tensor(float)`` / float16, etc.):
+      Use ``preprocess_image`` (ImageNet-style float32 NCHW) and apply softmax
+      + argmax in NumPy after inference.
     """
     session = get_onnx_session(onnx_model_path)
     inp_meta = session.get_inputs()[0]
     input_name = inp_meta.name
+    onnx_type = (getattr(inp_meta, "type", None) or "").lower()
+    expects_uint8 = "uint8" in onnx_type
 
     # Load image as RGB numpy array [H, W, 3] uint8
     image = load_image(image_path)
 
-    if input_name == "image":
-        # ── EBI-compliant model: uint8 [B, 3, H, W] ─────────
-        # Transpose HWC → CHW and add batch dim
+    if expects_uint8:
+        # ── uint8 NCHW (preprocessing may be inside the ONNX graph) ─────────
         img_chw = np.transpose(image, (2, 0, 1))[np.newaxis, ...]  # [1, 3, H, W]
-        img_input = img_chw.astype(np.uint8)
+        img_input = img_chw.astype(np.uint8, copy=False)
 
         outputs = session.run(None, {input_name: img_input})[0]  # [1, C, H, W]
-        # Output is already 0-100% softmax scores; argmax gives class label
         pred = outputs.argmax(axis=1)[0].astype(np.uint8)
     else:
-        # ── Legacy model: float32 preprocessed input ─────────
+        # ── Float preprocessed input (e.g. tensor(float)) ─────────
         img_tensor = pred_module.preprocess_image(image, device="cpu")
         inputs = img_tensor.numpy()  # [1, 3, H, W]
 
         outputs = session.run(None, {input_name: inputs})[0]  # [1, C, H, W]
 
-        # Softmax + argmax in NumPy
         logits = outputs
         logits = logits - logits.max(axis=1, keepdims=True)
         exp_logits = np.exp(logits)
         probs = exp_logits / exp_logits.sum(axis=1, keepdims=True)
         pred = probs.argmax(axis=1)[0].astype(np.uint8)
+
+    # ONNX graphs may emit H×W that differs slightly from the file (padding / fixed stride).
+    h, w = image.shape[:2]
+    if pred.shape[0] != h or pred.shape[1] != w:
+        pred = np.asarray(
+            Image.fromarray(pred, mode="L").resize((w, h), resample=Image.NEAREST),
+            dtype=np.uint8,
+        )
 
     return pred
 

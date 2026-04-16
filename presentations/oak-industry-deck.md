@@ -23,6 +23,48 @@ Nicholas Rodgers · Computer Vision Engineer · **Ten Oaks, LLC**
 
 ---
 
+## Current mill environment - Stacking Facility
+
+Boards move from packs through scanning equipment before grading and downstream processing.
+
+![width:320px](assets/pack_infeed.jpg) ![width:320px](assets/board_infeed.jpg) ![width:180px](assets/scanner_cabinet.jpg) 
+
+- **Pack infeed**: Green(not dried) lumber enters the facility in packs.
+- **Board infeed**: Individual boards conveyed for inspection and grading.
+- **Scanner cabinet**: Scanning and handling equipment.
+
+
+---
+
+## Scanner imaging - Stacking Facility
+
+Examples of how our scanner camera system sees boards in production - Stacking
+
+![w:550px](assets/NHLA.jpg) ![w:550px](assets/Sorting.jpg)
+
+---
+
+## Current mill environment - Flooring plant
+
+Boards move from packs through scanning equipment before grading and downstream processing.
+
+![width:320px](assets/dry_pack_infeed.jpg) ![width:320px](assets/Crosscut_infeed.jpg) 
+
+- **Pack infeed**: Kiln dried lumber enters the facility in packs.
+- **Board infeed**: Individual boards conveyed for inspection and grading.
+  - Boards are sent from the scanner to saws that cut the boards into pieces based on scanner decision
+
+
+---
+
+## Scanner imaging - Flooring Plant
+
+Examples of how our scanner camera system sees boards in production before going to the saws
+
+![width:800px](assets/Crosscut.jpg)
+
+---
+
 ## Why this problem
 
 - Mill throughput and consistent grading depend on **reliable defect cues** on every board.
@@ -31,22 +73,6 @@ Nicholas Rodgers · Computer Vision Engineer · **Ten Oaks, LLC**
 
 <!--
   Speaker: Connect to their world — recovery, rework, customer claims — without overclaiming autonomy. Next slide is the EBI contract detail.
--->
-
----
-
-## EBI-oriented ONNX contract (segmentation)
-
-What EBI’s interpreter expects — implemented in **`EBIExportWrapper`** in export cells (e.g. [`notebooks/Unet_FullImage.ipynb`](../notebooks/Unet_FullImage.ipynb), [`notebooks/DeepLabv3_FullImage.ipynb`](../notebooks/DeepLabv3_FullImage.ipynb)):
-
-- **Task shape**: **Dense semantic segmentation** — per-pixel class **scores** over the board. **No** instance NMS, **no** bounding-box head, **no** extra decoder post-processing on the host
-- **Input tensor**: **uint8** RGB, shape **`[B, 3, H, W]`**, raw **0–255** (CHW, batched).
-- **Bundled into the ONNX file** (host passes raw images only): rescale pixels to [0, 1], apply **ImageNet** normalization, run the segmentation model, then **softmax** and **×100** so every pixel has **C channels of class scores from 0–100** (percent scale).
-- **Output tensor**: **float32** **`[B, C, H, W]`** with `C` = number of classes; values interpretable as **percent** per channel (approximately **~100** when summed across `C` at each pixel).
-- **Naming**: some exports use ONNX input name **`image`** (EBI-oriented path in `notebooks/app.py`); others use **`input`** for the same numeric contract — **match whatever your EBI toolchain prescribes**.
-
-<!--
-  Speaker: If challenged on “official EBI spec,” point to your manufacturer packet; this slide reflects what we implemented to satisfy their interpreter + our export wrapper.
 -->
 
 ---
@@ -68,11 +94,9 @@ What EBI’s interpreter expects — implemented in **`EBIExportWrapper`** in ex
 
 - **Source**: line-scan RGB **TIFFs** (industrial-style plank imagery).
 - **Public release**: [Hugging Face — nrodgers98/Oak-Defect-Detection](https://huggingface.co/datasets/nrodgers98/Oak-Defect-Detection) (~1.5k samples, **CC BY-NC 4.0**).
-- **Typical classes**: Background, **BlackRot**, **Knot**, **Stain** — **not every experiment uses the same set** (e.g. some Optuna notebooks drop **Stain** or other rare classes). **Always pair a metric with the notebook + class list** when you present numbers.
+- **Typical classes**: Background, **BlackRot**, **Knot**, **Stain** 
 
-<!--
-  Speaker: Mention license if industry cares about redistribution; point to Hub for reproducibility. Mixed class sets are a feature of honest R&D — say you standardize per experiment.
--->
+
 
 ---
 
@@ -86,21 +110,7 @@ What EBI’s interpreter expects — implemented in **`EBIExportWrapper`** in ex
 
 - Automation: `notebooks/functions/` (`data_pipeline`, filtering, splits, HF download helper).
 
-<!--
-  Speaker: One sentence each box — you’re showing engineering discipline, not just model hacking.
--->
 
----
-
-## Modeling approach
-
-- **Task**: multi-class **semantic segmentation** (per-pixel class).
-- **Training**: pretrained encoders; **Albumentations**; full-image (and patch workflows in separate notebooks).
-- **Model selection**: best checkpoint by **validation IoU**, then **frozen test split** for reported scores.
-
-<!--
-  Speaker: This slide defends why inspection stakeholders should trust the headline numbers.
--->
 
 ---
 
@@ -111,11 +121,9 @@ What EBI’s interpreter expects — implemented in **`EBIExportWrapper`** in ex
 | **ResNet34–UNet** | Full image, patch training variant, **Optuna** tuning notebooks |
 | **ResNet34–U-Net++** | Full image + Optuna variant |
 | **ResNet34–DeepLabV3** | Full image + Optuna; ONNX export path in notebook |
-| **YOLO backbone + dense head** | Pixel logits for deployment-style export (see `YOLO+SegHead.ipynb`) |
+| **Other Architectures** | various other architectures(Yolo, FPN) |
 
-<!--
-  Speaker: You scoped the solution space — classical proven encoders plus a YOLO-feature experiment.
--->
+
 
 ---
 
@@ -125,22 +133,18 @@ What EBI’s interpreter expects — implemented in **`EBIExportWrapper`** in ex
 - **Examples of tuned knobs**: batch size, learning rate, weight decay, optimizer choice — *exact ranges in each `*_Optuna.ipynb`*.
 - **Objective**: maximize **validation IoU** (early stopping on plateau / best epoch per trial).
 
-<!--
-  Speaker: Skip trial counts unless asked — offer “in appendix” for detail.
--->
+
 
 ---
 
 ## How we measure quality
 
-- **Segmentation**: per-class **IoU**, **mean IoU** (often reported excluding background — **say which** when you quote numbers).
+- **Segmentation**: per-class **IoU**, **mean IoU**
 - **Classification-style**: macro / per-class **F1**, pixel **accuracy**.
 - **Diagnostics**: one-vs-rest **ROC-AUC**, **confusion matrix** (normalized).
 - **Rule**: metrics computed on **test** images only after choosing the best val checkpoint.
 
-<!--
-  Speaker: This slide preempts “how do we know it’s not cherry-picked?”
--->
+
 
 ---
 
@@ -150,62 +154,25 @@ What EBI’s interpreter expects — implemented in **`EBIExportWrapper`** in ex
 
 | Notebook | Classes (defects) | Mean IoU (excl. bg) | Macro F1 | Pixel acc. |
 |----------|-------------------|---------------------|----------|------------|
-| [`Unet_FullImage Optuna.ipynb`](../notebooks/Unet_FullImage%20Optuna.ipynb) | BlackRot, Knot | 0.465 | 0.736 | 0.946 |
+| [`Unet_FullImage_Optuna.ipynb`](../notebooks/Unet_FullImage_Optuna.ipynb) | BlackRot, Knot, Stain | 0.461 | 0.703 | 0.913 |
 | [`Unet++_FullImage_Optuna.ipynb`](../notebooks/Unet++_FullImage_Optuna.ipynb) | BlackRot, Knot, Stain | 0.477 | 0.720 | 0.934 |
 | [`DeepLabv3_FullImage_Optuna.ipynb`](../notebooks/DeepLabv3_FullImage_Optuna.ipynb) | BlackRot, Knot, Stain | 0.509 | 0.740 | 0.923 |
 
 *UNet rows: metrics from **saved** notebook outputs. DeepLabv3 Optuna: same **test split** and preprocessing size (384×1024), metrics and confusion matrix from **`models/onnx/deeplabv3_fullimage_optuna.onnx`** (notebook had no embedded evaluation figure). Re-run the notebook evaluation cell to align with a fresh `.pt` checkpoint if needed.*
 
 <!--
-  Speaker: All three rows are Optuna-tuned. UNet Optuna is three-way (Background, BlackRot, Knot). UNet++ and DeepLab are four-way (Background + three defects).
--->
-
----
-
-## Confusion matrix — `Unet_FullImage Optuna.ipynb`
-
-![width:640px](assets/cm_unet_fullimage_optuna.png)
-
-*Background, BlackRot, Knot — % of true class per row (test set).*
-
-<!--
-  Speaker: Diagonal dominance vs off-diagonal shows where the model confuses knot with rot, etc.
--->
-
----
-
-## Confusion matrix — `Unet++_FullImage_Optuna.ipynb`
-
-![width:640px](assets/cm_unetplusplus_fullimage_optuna.png)
-
-*Background, BlackRot, Knot, Stain — same normalization.*
-
-<!--
-  Speaker: Optuna-tuned U-Net++ with full four defect channels.
+  Speaker: All three rows are Optuna-tuned. UNet Optuna, UNet++, and DeepLab are all four-way on the test set (Background + BlackRot, Knot, Stain).
 -->
 
 ---
 
 ## Confusion matrix — `DeepLabv3_FullImage_Optuna.ipynb`
 
-![width:640px](assets/cm_deeplabv3_fullimage_optuna.png)
+![width:500px](assets/cm_deeplabv3_fullimage_optuna.png)
 
-*Background, BlackRot, Knot, Stain — test set, row-normalized (same convention as other notebooks). Figure built from exported ONNX on 384×1024 inputs; notebook evaluation cell can replace this after a full run.*
 
 <!--
   Speaker: DeepLabV3 + Optuna; CM artifact matches the EBI-style ONNX export used on the line scanner path.
--->
-
----
-
-## Deployment path
-
-- **ONNX**: export + **ONNX Runtime** verification in DeepLabV3-style notebooks (preprocessing / output scaling as implemented there).
-- **Streamlit**: toggle **PyTorch** vs **ONNX Runtime**; GPU when available.
-- **Integration story**: same class colormap and tensor shapes documented in app + export cells.
-
-<!--
-  Speaker: Position as prototype suitable for IT/plant discussion — not a claimed certified production system unless you own that.
 -->
 
 ---
@@ -216,9 +183,6 @@ What EBI’s interpreter expects — implemented in **`EBIExportWrapper`** in ex
 2. Pick backend (**PyTorch** or **ONNX**).
 3. Select image → **Generate prediction** → show **overlay** and class map.
 
-<!--
-  Speaker: If live demo is risky, use a screenshot slide instead — swap order with Results figure.
--->
 
 ---
 
@@ -228,9 +192,6 @@ What EBI’s interpreter expects — implemented in **`EBIExportWrapper`** in ex
 - **Generalization**: new lines, species, or lighting → expect **domain shift**; plan calibration data.
 - **Operations**: human review for edge cases; optional **active learning** / feedback loops.
 
-<!--
-  Speaker: Audiences trust you faster when you name limits before they do.
--->
 
 ---
 
@@ -240,9 +201,6 @@ What EBI’s interpreter expects — implemented in **`EBIExportWrapper`** in ex
 - **Dataset**: [nrodgers98/Oak-Defect-Detection](https://huggingface.co/datasets/nrodgers98/Oak-Defect-Detection)
 - **Questions**
 
-<!--
-  Put email or LinkedIn on this slide if appropriate for the forum.
--->
 
 ---
 
