@@ -15,9 +15,7 @@
 		"--ulimit", "stack=67108864", // Increase process stack limit to 64 MB
 		"--publish", "6006:6006",     // Map TensorBoard port for easy access
 		"--publish", "8080:8080",     // Map Optuna port for easy access
-		"--publish", "8501:8501",     // Map Streamlit port for easy access
-		"--network=bridge",            // Explicitly use bridge network for internet access
-		"--dns=8.8.8.8"               // Use Google's public DNS for internet access
+		"--publish", "8501:8501"      // Map Streamlit port for easy access
 	],
 	"remoteUser": "vscode",           // Use the 'vscode' user provided by the base image
 	"containerEnv": {
