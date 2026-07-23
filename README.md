@@ -121,12 +121,19 @@ from functions.data_pipeline import prepare_dataset
 
 RAW_DIR = ensure_oak_raw_data()  # downloads once; skips if *.tif already present
 DATA_ROOT, class_mapping = prepare_dataset(raw_data_folder=str(RAW_DIR))
+
+# Optional: pick a custom folder name under data/
+# RAW_DIR = ensure_oak_raw_data(raw_folder_name="my-raw-oak-data")
+# DATA_ROOT, class_mapping = prepare_dataset(raw_data_folder=str(RAW_DIR))
 ```
 
 **Option B — command line** from the repository root:
 
 ```bash
 python notebooks/functions/oak_hf_dataset.py
+
+# Optional custom folder under data/
+# python notebooks/functions/oak_hf_dataset.py --raw-folder-name my-raw-oak-data
 ```
 
 Use `python notebooks/functions/oak_hf_dataset.py --force` to replace existing `data/raw-data/*.tif` with a fresh copy from the Hub. Set `HF_TOKEN` if you need higher rate limits or access to a private fork.

@@ -22,14 +22,15 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parent.parent.parent
 
 
-def default_raw_data_path() -> Path:
-    """``<project>/data/raw-data`` (same default as ``prepare_dataset``)."""
-    return _repo_root() / "data" / "raw-data"
+def default_raw_data_path(raw_folder_name: str = "raw-data") -> Path:
+    """``<project>/data/<raw_folder_name>`` (default: ``data/raw-data``)."""
+    return _repo_root() / "data" / raw_folder_name
 
 
 def ensure_oak_raw_data(
     dest_dir: str | Path | None = None,
     *,
+    raw_folder_name: str = "raw-data",
     repo_id: str = HF_OAK_DEFECT_DATASET_REPO,
     force: bool = False,
 ) -> Path:
@@ -43,7 +44,11 @@ def ensure_oak_raw_data(
     Parameters
     ----------
     dest_dir
-        Target directory (defaults to ``data/raw-data`` at the project root).
+        Target directory. If not provided, uses ``data/<raw_folder_name>`` at
+        the project root.
+    raw_folder_name
+        Name of the raw-data folder under ``data/`` when *dest_dir* is not
+        provided (default: ``raw-data``).
     repo_id
         Hugging Face dataset repository id.
     force
@@ -54,7 +59,7 @@ def ensure_oak_raw_data(
     pathlib.Path
         Resolved path to *dest_dir*.
     """
-    dest = Path(dest_dir) if dest_dir is not None else default_raw_data_path()
+    dest = Path(dest_dir) if dest_dir is not None else default_raw_data_path(raw_folder_name)
     dest = dest.resolve()
     dest.mkdir(parents=True, exist_ok=True)
 
@@ -87,11 +92,19 @@ if __name__ == "__main__":
 
     p = argparse.ArgumentParser(description="Download Oak Defect Detection raw-data from Hugging Face")
     p.add_argument(
+        "--raw-folder-name",
+        default="raw-data",
+        help="Folder name under data/ when --output is not set (default: raw-data)",
+    )
+    p.add_argument(
         "-o",
         "--output",
         type=Path,
         default=None,
-        help=f"Output directory (default: {default_raw_data_path()})",
+        help=(
+            "Output directory. If omitted, files go to "
+            "<repo>/data/<raw-folder-name>."
+        ),
     )
     p.add_argument(
         "-f",
@@ -105,5 +118,10 @@ if __name__ == "__main__":
         help="Hugging Face dataset repo id",
     )
     args = p.parse_args()
-    out = ensure_oak_raw_data(args.output, repo_id=args.repo, force=args.force)
+    out = ensure_oak_raw_data(
+        args.output,
+        raw_folder_name=args.raw_folder_name,
+        repo_id=args.repo,
+        force=args.force,
+    )
     print(f"Oak raw data ready at: {out}")
