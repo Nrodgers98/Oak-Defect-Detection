@@ -27,25 +27,33 @@ Linux users should also install the [NVIDIA Container Toolkit](https://docs.nvid
 ```
 Oak-Defect-Detection/
 ├── .devcontainer/               # Dev container configuration
-├── data/                        # Raw, filtered, and organized datasets
+├── data/                        # Raw data, NHLA exports, and organized datasets
+│   ├── 26-8-18 Test/            # Example archive with XML + board image exports
+│   ├── filtered-data/            # Filtered/invalid samples
+│   └── organized-data/           # Legacy segmentation dataset layout
 ├── logs/                        # TensorBoard logs
 ├── models/                      # Saved model files
 ├── notebooks/                   # Training, evaluation, experiments
-│   ├── functions/               # Custom helper modules (incl. ``oak_hf_dataset.py``)
+│   ├── functions/               # Project helper modules
+│   ├── NHLA_Classification.py   # NHLA classification training script
+│   ├── NHLA_Classification.ipynb # NHLA notebook pipeline
+│   ├── nhla_grade_dataset.py    # XML + image extractor for NHLA grades
 │   ├── Unet_FullImage.ipynb     # Full-image UNet training pipeline
 │   ├── Unet_FullImage Optuna.ipynb  # Hyperparameter optimization with Optuna
 │   ├── Unet_Patches.ipynb       # Patch-based UNet training pipeline
 │   ├── environment_test.ipynb  # Environment verification and GPU testing
-│   └── app.py        # Interactive web app for model inference
+│   └── app.py                   # Interactive web app for model inference
 ├── .gitignore
 ├── LICENSE
-└── README.md
+├── README.md
+└── requirements.txt
 ```
 
 ## Oak defect detection workflow (high level)
 
+### Segmentation pipeline
 1. **Data audit and normalization**  
-   Analyze raw line‑scan imagery and normalize defect class naming.
+   Analyze raw line-scan imagery and normalize defect class naming.
 
 2. **Class filtering**  
    Move rare classes below a mask-count threshold to reduce imbalance.
@@ -54,17 +62,53 @@ Oak-Defect-Detection/
    Align images/masks, validate samples, and quarantine invalid data.
 
 4. **Mask composition**  
-   Merge per‑class masks into a single multi‑class mask per image.
+   Merge per-class masks into a single multi-class mask per image.
 
 5. **Train/val/test split**  
    Persist split metadata for repeatable experiments.
 
 6. **Model training**  
-   Train a ResNet34‑UNet with Albumentations augmentations and TensorBoard logging.
+   Train a ResNet34-UNet with Albumentations augmentations and TensorBoard logging.
 
 7. **Evaluation**  
-   Select best checkpoint by validation IoU, then compute test metrics:
+   Select the best checkpoint by validation IoU, then compute test metrics:
    mean IoU, F1, accuracy, ROC curves, and confusion matrix.
+
+### NHLA classification workflow
+This repository includes a dedicated NHLA grading pipeline for the scanner export data. The workflow is split into a 1-side classifier and a 2-side board-level classifier so each model can be trained and evaluated independently.
+
+1. **Archive export ingestion**  
+   A scanner export folder contains XML files plus the matching board images. The XML stores the top/bottom vision grades and any grader override.
+
+2. **XML-to-CSV extraction**  
+   The script `notebooks/functions/nhla_grade_dataset.py` reads the XML metadata, resolves the valid grade per face, associates each board image to its top and bottom view, and produces:
+   - `nhla_face_labels.csv`
+   - `nhla_board_labels.csv`
+   - `grade_mapping.json`
+
+3. **Grade prioritization rule**  
+   The extraction logic follows the scanner grade precedence:
+   - if `NHLA_Grade_Validation` is present and non-zero, use it
+   - otherwise fall back to `NHLA_Grade_Vision`
+   - this enforces the same validation override behavior used by the grader
+
+4. **Two classification models**  
+   - **1-side model**: predicts the grade from a single face image.
+   - **2-side model**: predicts the board grade from both top and bottom images together.
+
+5. **Optuna tuning and final training**  
+   The shared training logic in `notebooks/NHLA_Classification.py` supports configurable encoders (`resnet18`, `resnet34`, `resnet50`), a tunable Optuna search space, and a final training pass that uses the best Optuna parameters rather than the default configuration values. The Optuna database remains the source of truth for the trial history.
+
+6. **Artifact layout**  
+   Final model runs keep the model directory clean:
+   - `models/NHLA_Classification_1Side/checkpoints/` stores periodic epoch snapshots every N epochs
+   - `models/NHLA_Classification_1Side/model_best.pt` stores the best model checkpoint
+   - TensorBoard logs are stored under `logs/tensorboard/...`
+   - metrics and class mapping artifacts are saved under a configurable `metrics_dir`, such as `metrics/NHLA_Classification_1Side/`
+   - the Optuna database is stored under `logs/optuna/...` and not copied into the model output folder
+
+7. **Evaluation and deployment**  
+   Each run saves classification metrics including accuracy, balanced accuracy, macro/weighted F1, confusion matrix, classification report, and optional plots. These artifacts can be compared across the 1-side and 2-side workflows before deployment.
 
 ## Custom functions
 
@@ -149,7 +193,76 @@ For training with this repository’s notebooks, Option A is recommended so `pre
 
 ## How to run
 
-### Training notebooks
+### NHLA classification workflow
+
+1. Prepare your scanner archive folder. It should contain:
+   - XML files with the NHLA grade metadata
+   - corresponding top and bottom board images
+
+2. Run the XML extraction pipeline from the repo root:
+
+```bash
+python notebooks/functions/nhla_grade_dataset.py --scan-root "data/26-8-18 Test"
+```
+
+This creates a folder such as:
+
+```text
+data/26-8-18 Test/nhla_dataset/
+├── nhla_face_labels.csv
+├── nhla_board_labels.csv
+├── grade_mapping.json
+```
+
+3. Train the face-only model:
+
+```bash
+python notebooks/NHLA_Classification_1Side.py \
+  --csv-path "data/26-8-18 Test/nhla_dataset/nhla_face_labels.csv" \
+  --output-dir "models/NHLA_Classification_1Side" \
+  --epochs 12 \
+  --batch-size 16 \
+  --lr 1e-3 \
+  --val-split 0.2 \
+  --seed 42 \
+  --checkpoint-interval 5 \
+  --tensorboard-dir "logs/tensorboard/NHLA_Classification_1Side" \
+  --metrics-dir "metrics/NHLA_Classification_1Side"
+```
+
+4. Train the paired board model:
+
+```bash
+python notebooks/NHLA_Classification_2Side.py \
+  --csv-path "data/26-8-18 Test/nhla_dataset/nhla_board_labels.csv" \
+  --output-dir "models/NHLA_Classification_2Side" \
+  --epochs 12 \
+  --batch-size 8 \
+  --lr 1e-3 \
+  --val-split 0.2 \
+  --seed 42 \
+  --checkpoint-interval 5 \
+  --tensorboard-dir "logs/tensorboard/NHLA_Classification_2Side" \
+  --metrics-dir "metrics/NHLA_Classification_2Side"
+```
+
+5. Optional Optuna tuning before final training:
+
+```bash
+python notebooks/NHLA_Classification_1Side.py \
+  --csv-path "data/26-8-18 Test/nhla_dataset/nhla_face_labels.csv" \
+  --output-dir "models/NHLA_Classification_1Side" \
+  --optuna-trials 5 \
+  --tune-epochs 4 \
+  --checkpoint-interval 5
+```
+
+6. Open the notebook version for interactive execution:
+   - `notebooks/NHLA_Classification_1Side.ipynb`
+   - `notebooks/NHLA_Classification_2Side.ipynb`
+   - `notebooks/NHLA_Classification.py`
+
+### Segmentation training notebooks
 
 1. Open the repository in a VS Code dev container.  
 2. Run one of the training notebooks from top to bottom:
@@ -192,11 +305,25 @@ See `STREAMLIT_README.md` for detailed usage instructions.
 
 ## Metrics reported
 
-- Mean IoU (per‑class and averaged)
-- F1 score (per‑class and macro)
-- Accuracy (pixel‑level)
-- ROC curves (one‑vs‑rest)
-- Confusion matrix (percentage‑normalized)
+### Segmentation metrics
+- Mean IoU (per-class and averaged)
+- F1 score (per-class and macro)
+- Accuracy (pixel-level)
+- ROC curves (one-vs-rest)
+- Confusion matrix (percentage-normalized)
+
+### NHLA classification metrics
+- Accuracy
+- Balanced accuracy
+- Macro precision / recall / F1
+- Weighted precision / recall / F1
+- Micro F1
+- Per-class precision / recall / F1
+- Confusion matrix
+- One-vs-rest ROC AUC
+- Classification report
+
+All classification metrics are logged to TensorBoard and saved as JSON files in the model output directory.
 
 ## Notes
 
