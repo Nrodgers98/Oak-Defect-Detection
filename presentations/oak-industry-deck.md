@@ -61,7 +61,7 @@ Boards move from packs through scanning equipment before grading and downstream 
 
 Examples of how our scanner camera system sees boards in production before going to the saws
 
-![width:800px](assets/Crosscut.jpg)
+![width:800px](assets/CrossCut.jpg)
 
 ---
 
@@ -154,7 +154,7 @@ Examples of how our scanner camera system sees boards in production before going
 
 | Notebook | Classes (defects) | Mean IoU (excl. bg) | Macro F1 | Pixel acc. |
 |----------|-------------------|---------------------|----------|------------|
-| [`Unet_FullImage_Optuna.ipynb`](../notebooks/Unet_FullImage_Optuna.ipynb) | BlackRot, Knot, Stain | 0.461 | 0.703 | 0.913 |
+| `Unet_FullImage_Optuna.ipynb` (retired) | BlackRot, Knot, Stain | 0.461 | 0.703 | 0.913 |
 | [`Unet++_FullImage_Optuna.ipynb`](../notebooks/Unet++_FullImage_Optuna.ipynb) | BlackRot, Knot, Stain | 0.477 | 0.720 | 0.934 |
 | [`DeepLabv3_FullImage_Optuna.ipynb`](../notebooks/DeepLabv3_FullImage_Optuna.ipynb) | BlackRot, Knot, Stain | 0.509 | 0.740 | 0.923 |
 

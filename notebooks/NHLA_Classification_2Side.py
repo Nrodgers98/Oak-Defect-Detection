@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from notebooks.NHLA_Classification import run_optuna_tuning, train_model
+from notebooks.NHLA_Classification import DEFAULT_CANVAS, DEFAULT_IMAGE_SCALE, run_optuna_tuning, train_model
 
 
 def train_2side(
@@ -37,6 +37,12 @@ def train_2side(
     image_size: int = 224,
     num_workers: int = 2,
     cuda_device_index: int = 0,
+    tune_subset_fraction: float = 1.0,
+    image_cache_dir: str | None = None,
+    image_scale: float = DEFAULT_IMAGE_SCALE,
+    canvas: tuple = DEFAULT_CANVAS,
+    two_side_fusion: str = "shared",
+    init_checkpoint: str | None = None,
 ):
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -65,6 +71,12 @@ def train_2side(
             image_size=image_size,
             num_workers=num_workers,
             cuda_device_index=cuda_device_index,
+            subset_fraction=tune_subset_fraction,
+            image_cache_dir=image_cache_dir,
+            image_scale=image_scale,
+            canvas=canvas,
+            two_side_fusion=two_side_fusion,
+            init_checkpoint=init_checkpoint,
         )
         print(f"Best 2-side Optuna params: {best_params}")
 
@@ -92,6 +104,11 @@ def train_2side(
         image_size=image_size,
         num_workers=num_workers,
         cuda_device_index=cuda_device_index,
+        image_cache_dir=image_cache_dir,
+        image_scale=image_scale,
+        canvas=canvas,
+        two_side_fusion=two_side_fusion,
+        init_checkpoint=init_checkpoint,
     )
 
     params_path = Path(metrics_dir) / "best_params.json" if metrics_dir is not None else output_root / "best_params.json"
@@ -125,6 +142,12 @@ def main():
     parser.add_argument("--image-size", type=int, default=224, help="Input image size (square)")
     parser.add_argument("--num-workers", type=int, default=2, help="DataLoader worker processes")
     parser.add_argument("--cuda-device-index", type=int, default=0, help="CUDA device index to use (0, 1, ...) when CUDA is available")
+    parser.add_argument("--tune-subset-fraction", type=float, default=1.0, help="Fraction of boards (label-stratified) used for Optuna trials")
+    parser.add_argument("--image-cache-dir", type=str, default=None, help="Root for the decoded image cache (default ~/.cache/nhla_images or $NHLA_CACHE_DIR)")
+    parser.add_argument("--image-scale", type=float, default=DEFAULT_IMAGE_SCALE, help="Fixed resize factor applied to every face (native is 1 mm/px along the board)")
+    parser.add_argument("--canvas", type=int, nargs=2, default=list(DEFAULT_CANVAS), metavar=("HEIGHT", "WIDTH"), help="Padded input size")
+    parser.add_argument("--two-side-fusion", type=str, default="shared", choices=["shared", "stacked", "channels"], help="How the board model combines the two faces")
+    parser.add_argument("--init-checkpoint", type=str, default=None, help="1-side model_best.pt to initialise the shared backbone from")
     args = parser.parse_args()
 
     output = train_2side(
@@ -146,6 +169,12 @@ def main():
         image_size=args.image_size,
         num_workers=args.num_workers,
         cuda_device_index=args.cuda_device_index,
+        tune_subset_fraction=args.tune_subset_fraction,
+        image_cache_dir=args.image_cache_dir,
+        image_scale=args.image_scale,
+        canvas=tuple(args.canvas),
+        two_side_fusion=args.two_side_fusion,
+        init_checkpoint=args.init_checkpoint,
     )
     print(json.dumps({"best_params": output["best_params"], "metrics": output["result"]["metrics"]}, indent=2))
 

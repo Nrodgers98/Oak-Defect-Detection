@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import random
+import sys
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -30,7 +32,14 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 from torchvision import models, transforms
+from torchvision.io import decode_jpeg
 from torchvision.models import ResNet18_Weights, ResNet34_Weights, ResNet50_Weights
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from notebooks.functions.nhla_image_cache import ensure_image_cache
 
 SUPPORTED_ENCODERS = ["resnet18", "resnet34", "resnet50"]
 ENCODER_WEIGHTS = {
@@ -133,6 +142,113 @@ class BoardDataset(Dataset):
         return top, bottom, label
 
 
+DEFAULT_IMAGE_SCALE = 0.375          # native 1 mm/px along the board -> ~2.7 mm/px
+DEFAULT_CANVAS = (512, 1888)         # (height, width); fits 99% of faces at DEFAULT_IMAGE_SCALE
+_IMAGENET_MEAN_RGB = (124, 116, 104)  # padding value; normalizes to ~0
+
+
+class CachedImageDataset(Dataset):
+    """Serves uint8 CHW faces from the JPEG shard cache built by ``ensure_image_cache``.
+
+    Each face is decoded at its cached (fixed-scale) size and pasted top-left onto a
+    ``canvas`` (height, width) filled with the ImageNet mean colour, so every board keeps
+    its true physical size. ``image_indices`` is ``(N,)`` for face mode or ``(N, 2)``
+    (top, bottom) for board mode. Only NumPy arrays are held, so DataLoader workers don't
+    slowly copy a large DataFrame.
+    """
+
+    def __init__(self, cache_dir: str | Path, image_indices: np.ndarray, labels: np.ndarray, canvas: Tuple[int, int] = DEFAULT_CANVAS):
+        self.cache_dir = Path(cache_dir)
+        self.image_indices = np.asarray(image_indices, dtype=np.int64)
+        self.labels = np.asarray(labels, dtype=np.int64)
+        self.canvas = canvas
+        self._index = None
+
+    def __len__(self) -> int:
+        return len(self.labels)
+
+    def _image(self, index: int) -> torch.Tensor:
+        if self._index is None:
+            self._index = np.load(self.cache_dir / "index.npy")
+        shard, offset, length, height, width = (int(v) for v in self._index[index])
+        fd = os.open(self.cache_dir / "shards" / f"{shard:05d}.bin", os.O_RDONLY)
+        try:
+            payload = os.pread(fd, length, offset)
+        finally:
+            os.close(fd)
+        face = decode_jpeg(torch.frombuffer(bytearray(payload), dtype=torch.uint8))
+        canvas = torch.tensor(_IMAGENET_MEAN_RGB, dtype=torch.uint8).view(3, 1, 1).repeat(1, *self.canvas)
+        canvas[:, :height, :width] = face
+        return canvas
+
+    def __getitem__(self, idx: int):
+        row = self.image_indices[idx]
+        label = int(self.labels[idx])
+        if row.ndim == 0:
+            return self._image(int(row)), label
+        return self._image(int(row[0])), self._image(int(row[1])), label
+
+
+_IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1) * 255.0
+_IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1) * 255.0
+
+
+def prepare_images(images: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Move a batch to *device*; uint8 batches from the cache are ImageNet-normalized on the GPU."""
+    images = images.to(device, non_blocking=True)
+    if images.dtype == torch.uint8:
+        images = (images.float() - _IMAGENET_MEAN.to(device)) / _IMAGENET_STD.to(device)
+    return images.contiguous(memory_format=torch.channels_last)
+
+
+def image_path_columns(mode: str) -> List[str]:
+    return ["image_path"] if mode == "face" else ["top_image_path", "bottom_image_path"]
+
+
+def build_image_cache_for_csv(
+    csv_path: str,
+    mode: str = "face",
+    image_scale: float = DEFAULT_IMAGE_SCALE,
+    canvas: Tuple[int, int] = DEFAULT_CANVAS,
+    cache_root: str | None = None,
+    num_workers: int | None = None,
+):
+    """Build (or reuse) the fixed-scale image cache for the dataset that *csv_path* belongs to.
+
+    The cache covers every image referenced by any label CSV in the same folder
+    (face, validated face, board), so 1-side and 2-side training share one cache.
+    """
+    csv_path = Path(csv_path).resolve()
+    paths = set()
+    for sibling in sorted(csv_path.parent.glob("*.csv")):
+        columns = pd.read_csv(sibling, nrows=0).columns
+        image_columns = [c for c in ("image_path", "top_image_path", "bottom_image_path") if c in columns]
+        if image_columns:
+            frame = pd.read_csv(sibling, usecols=image_columns)
+            paths.update(frame.stack().dropna().astype(str))
+    paths.discard("")
+    return ensure_image_cache(
+        sorted(paths),
+        scale=image_scale,
+        max_height=canvas[0],
+        max_width=canvas[1],
+        cache_root=cache_root,
+        name_hint=csv_path.parent.parent.name,
+        num_workers=num_workers,
+    )
+
+
+def subsample_boards(df: pd.DataFrame, fraction: float, seed: int = 42) -> pd.DataFrame:
+    """Keep a label-stratified *fraction* of boards (all rows of each kept board)."""
+    if fraction >= 1.0:
+        return df
+    board_labels = df.groupby("board_id")["label_name"].first()
+    kept = board_labels.groupby(board_labels, group_keys=False).apply(
+        lambda group: group.sample(n=max(1, round(len(group) * fraction)), random_state=seed)
+    )
+    return df[df["board_id"].isin(kept.index)].reset_index(drop=True)
+
+
 class FaceClassifier(nn.Module):
     def __init__(self, num_classes: int, encoder_name: str = "resnet18", pretrained: bool = True):
         super().__init__()
@@ -143,15 +259,60 @@ class FaceClassifier(nn.Module):
         return self.backbone(x)
 
 
+TWO_SIDE_FUSIONS = ["shared", "stacked", "channels"]
+
+
 class DualFaceClassifier(nn.Module):
-    def __init__(self, num_classes: int, encoder_name: str = "resnet18", pretrained: bool = True):
+    """Board-level classifier over the top and bottom faces.
+
+    ``fusion``:
+      * ``"shared"`` (default): one 3-channel backbone runs on each face; the two pooled
+        feature vectors are concatenated and classified. Can be initialised from a 1-side
+        ``FaceClassifier`` checkpoint via ``load_face_backbone``.
+      * ``"stacked"``: top and bottom are stacked vertically into one image (3 channels).
+      * ``"channels"``: legacy 6-channel input (top RGB + bottom RGB); first conv is random.
+    """
+
+    def __init__(self, num_classes: int, encoder_name: str = "resnet18", pretrained: bool = True, fusion: str = "shared"):
         super().__init__()
-        self.backbone = build_resnet_backbone(encoder_name=encoder_name, pretrained=pretrained, in_channels=6)
-        self.backbone.fc = nn.Linear(self.backbone.fc.in_features, num_classes)
+        if fusion not in TWO_SIDE_FUSIONS:
+            raise ValueError(f"Unsupported fusion '{fusion}'. Choose from: {TWO_SIDE_FUSIONS}")
+        self.fusion = fusion
+        self.backbone = build_resnet_backbone(encoder_name=encoder_name, pretrained=pretrained, in_channels=6 if fusion == "channels" else 3)
+        features = self.backbone.fc.in_features
+        if fusion == "shared":
+            self.backbone.fc = nn.Identity()
+            self.head = nn.Linear(2 * features, num_classes)
+        else:
+            self.backbone.fc = nn.Linear(features, num_classes)
 
     def forward(self, top: torch.Tensor, bottom: torch.Tensor) -> torch.Tensor:
-        stacked = torch.cat([top, bottom], dim=1)
-        return self.backbone(stacked)
+        if self.fusion == "shared":
+            features = self.backbone(torch.cat([top, bottom], dim=0))
+            top_features, bottom_features = features.chunk(2, dim=0)
+            return self.head(torch.cat([top_features, bottom_features], dim=1))
+        if self.fusion == "stacked":
+            return self.backbone(torch.cat([top, bottom], dim=2))
+        return self.backbone(torch.cat([top, bottom], dim=1))
+
+    def load_face_backbone(self, checkpoint_path: str | Path) -> None:
+        """Copy backbone weights (everything except the classifier) from a 1-side checkpoint."""
+        state = torch.load(checkpoint_path, map_location="cpu")
+        backbone_state = {k[len("backbone."):]: v for k, v in state.items() if k.startswith("backbone.") and not k.startswith("backbone.fc.")}
+        missing, unexpected = self.backbone.load_state_dict(backbone_state, strict=False)
+        missing = [k for k in missing if not k.startswith("fc.")]
+        if missing or unexpected:
+            raise ValueError(f"Checkpoint {checkpoint_path} does not match this backbone: missing={missing[:5]} unexpected={unexpected[:5]}")
+
+
+def encoder_from_checkpoint(checkpoint_path: str | Path) -> str:
+    """Infer resnet18/34/50 from a FaceClassifier state dict."""
+    keys = torch.load(checkpoint_path, map_location="cpu").keys()
+    if any(k.startswith("backbone.layer1.0.conv3.") for k in keys):
+        return "resnet50"
+    if any(k.startswith("backbone.layer3.5.") for k in keys):
+        return "resnet34"
+    return "resnet18"
 
 
 def build_class_mapping(labels: List[str]) -> Dict[str, int]:
@@ -209,17 +370,19 @@ def compute_metrics(y_true: List[int], y_pred: List[int], y_prob: np.ndarray | N
 
     if len(labels) > 2 and y_prob is not None:
         y_bin = label_binarize(y_true, classes=list(range(len(labels))))
-        if y_bin.shape[1] == 1:
-            metrics["roc_auc_ovr_macro"] = None
+        # Macro one-vs-rest AUC over the classes present in y_true (rare grades can be absent from a split).
+        present = [c for c in range(y_bin.shape[1]) if 0 < y_bin[:, c].sum() < len(y_bin)]
+        if present:
+            metrics["roc_auc_ovr_macro"] = float(np.mean([roc_auc_score(y_bin[:, c], y_prob[:, c]) for c in present]))
         else:
-            metrics["roc_auc_ovr_macro"] = roc_auc_score(y_bin, y_prob, multi_class="ovr", average="macro")
+            metrics["roc_auc_ovr_macro"] = None
     else:
         metrics["roc_auc_ovr_macro"] = None
 
     return metrics
 
 
-def evaluate_model(model: nn.Module, loader: DataLoader, device: torch.device, class_names: List[str], is_board_model: bool = False):
+def evaluate_model(model: nn.Module, loader: DataLoader, device: torch.device, class_names: List[str], is_board_model: bool = False, use_amp: bool = False):
     model.eval()
     all_targets = []
     all_preds = []
@@ -229,14 +392,13 @@ def evaluate_model(model: nn.Module, loader: DataLoader, device: torch.device, c
         for batch in loader:
             if is_board_model:
                 top, bottom, targets = batch
-                top = top.to(device)
-                bottom = bottom.to(device)
-                outputs = model(top, bottom)
+                with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
+                    outputs = model(prepare_images(top, device), prepare_images(bottom, device))
             else:
                 images, targets = batch
-                images = images.to(device)
-                outputs = model(images)
-            logits = outputs
+                with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
+                    outputs = model(prepare_images(images, device))
+            logits = outputs.float()
             probs = torch.softmax(logits, dim=1).cpu().numpy()
             preds = torch.argmax(logits, dim=1).cpu().tolist()
             targets = targets.cpu().tolist()
@@ -246,6 +408,23 @@ def evaluate_model(model: nn.Module, loader: DataLoader, device: torch.device, c
 
     prob_array = np.concatenate(all_probs, axis=0) if all_probs else np.empty((0, len(class_names)))
     return compute_metrics(all_targets, all_preds, prob_array if prob_array.size else None, class_names)
+
+
+def release_loaders(*loaders: DataLoader) -> None:
+    """Stop persistent workers and free cached pinned host buffers.
+
+    Full-resolution batches are large and WSL2 limits page-locked memory, so buffers
+    cached by earlier runs in the same process (e.g. Optuna trials) must be returned.
+    """
+    for loader in loaders:
+        iterator = getattr(loader, "_iterator", None)
+        if iterator is not None and hasattr(iterator, "_shutdown_workers"):
+            iterator._shutdown_workers()
+        loader._iterator = None
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch._C._host_emptyCache()
 
 
 def train_model(
@@ -272,9 +451,30 @@ def train_model(
     image_size: int = 224,
     num_workers: int = 2,
     cuda_device_index: int = 0,
+    use_image_cache: bool = True,
+    image_cache_dir: str | None = None,
+    subset_fraction: float = 1.0,
+    use_amp: bool = True,
+    epoch_callback=None,
+    image_scale: float = DEFAULT_IMAGE_SCALE,
+    canvas: Tuple[int, int] = DEFAULT_CANVAS,
+    two_side_fusion: str = "shared",
+    init_checkpoint: str | None = None,
 ):
+    """Train a face or board classifier.
+
+    ``use_image_cache`` reads faces resized by the fixed ``image_scale`` and padded onto a
+    ``canvas`` (height, width) from a decode-once JPEG cache (see
+    ``functions/nhla_image_cache.py``); it's built the first time it's needed. Without the
+    cache, images are read from disk and squashed to ``image_size`` x ``image_size``.
+    ``two_side_fusion`` / ``init_checkpoint`` configure the board model (see
+    ``DualFaceClassifier``); ``init_checkpoint`` is a 1-side ``model_best.pt``.
+    ``subset_fraction`` < 1 trains and validates on a label-stratified subset of boards.
+    ``epoch_callback(epoch, val_macro_f1)`` is called after every epoch (used for Optuna pruning).
+    """
     set_seed(seed)
     device = resolve_device(cuda_device_index=cuda_device_index)
+    torch.backends.cudnn.benchmark = True  # fixed input shape -> autotune conv kernels once
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
 
@@ -297,6 +497,17 @@ def train_model(
     class_mapping = build_class_mapping(df["label_name"].tolist())
     df["label_index"] = df["label_name"].map(class_mapping)
 
+    if use_image_cache:
+        cache_dir, path_to_index = build_image_cache_for_csv(csv_path, mode, image_scale=image_scale, canvas=canvas, cache_root=image_cache_dir)
+        index_columns = []
+        for column in image_path_columns(mode):
+            df[f"{column}_cache_idx"] = df[column].map(path_to_index)
+            index_columns.append(f"{column}_cache_idx")
+        df = df.dropna(subset=index_columns).reset_index(drop=True)
+        df[index_columns] = df[index_columns].astype(np.int64)
+
+    df = subsample_boards(df, subset_fraction, seed=seed)
+
     train_df, val_df = split_board_ids(df, val_split=val_split, seed=seed)
     class_names = [k for k, _ in sorted(class_mapping.items(), key=lambda x: x[1])]
 
@@ -307,45 +518,34 @@ def train_model(
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ]
     )
-    pin_memory = torch.cuda.is_available()
+    # No pinning: WSL2 caps page-locked memory at ~1 GB, which batch 32 x workers x prefetch
+    # at this canvas overflows. Unpinned uint8 copies cost ~10 ms/batch, negligible vs. compute.
+    pin_memory = False
     persistent_workers = num_workers > 0
+    use_amp = use_amp and device.type == "cuda"
 
+    def make_dataset(frame: pd.DataFrame) -> Dataset:
+        if use_image_cache:
+            indices = frame[index_columns].to_numpy()
+            return CachedImageDataset(cache_dir, indices[:, 0] if mode == "face" else indices, frame["label_index"].to_numpy(), canvas=canvas)
+        return FaceDataset(frame, transform=transform) if mode == "face" else BoardDataset(frame, transform=transform)
+
+    loader_kwargs = dict(
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=2 if num_workers > 0 else None,
+    )
+    train_loader = DataLoader(make_dataset(train_df), shuffle=True, **loader_kwargs)
+    val_loader = DataLoader(make_dataset(val_df), shuffle=False, **loader_kwargs)
     if mode == "face":
-        train_loader = DataLoader(
-            FaceDataset(train_df, transform=transform),
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            persistent_workers=persistent_workers,
-        )
-        val_loader = DataLoader(
-            FaceDataset(val_df, transform=transform),
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            persistent_workers=persistent_workers,
-        )
-        model = FaceClassifier(len(class_names), encoder_name=encoder_name, pretrained=pretrained).to(device)
+        model = FaceClassifier(len(class_names), encoder_name=encoder_name, pretrained=pretrained)
     else:
-        train_loader = DataLoader(
-            BoardDataset(train_df, transform=transform),
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            persistent_workers=persistent_workers,
-        )
-        val_loader = DataLoader(
-            BoardDataset(val_df, transform=transform),
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            persistent_workers=persistent_workers,
-        )
-        model = DualFaceClassifier(len(class_names), encoder_name=encoder_name, pretrained=pretrained).to(device)
+        model = DualFaceClassifier(len(class_names), encoder_name=encoder_name, pretrained=pretrained, fusion=two_side_fusion)
+        if init_checkpoint:
+            model.load_face_backbone(init_checkpoint)
+    model = model.to(device).to(memory_format=torch.channels_last)
 
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
@@ -360,16 +560,11 @@ def train_model(
         model.train()
         train_loss = 0.0
         for batch in train_loader:
-            if mode == "face":
-                images, targets = batch
-                images, targets = images.to(device), targets.to(device)
-                outputs = model(images)
-            else:
-                top, bottom, targets = batch
-                top, bottom, targets = top.to(device), bottom.to(device), targets.to(device)
-                outputs = model(top, bottom)
-            optimizer.zero_grad()
-            loss = criterion(outputs, targets)
+            targets = batch[-1].to(device, non_blocking=True)
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
+                outputs = model(*(prepare_images(images, device) for images in batch[:-1]))
+                loss = criterion(outputs.float(), targets)
+            optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
             train_loss += loss.item() * targets.size(0)
@@ -383,15 +578,10 @@ def train_model(
 
         with torch.no_grad():
             for batch in val_loader:
-                if mode == "face":
-                    images, targets = batch
-                    images, targets = images.to(device), targets.to(device)
-                    outputs = model(images)
-                else:
-                    top, bottom, targets = batch
-                    top, bottom, targets = top.to(device), bottom.to(device), targets.to(device)
-                    outputs = model(top, bottom)
-
+                targets = batch[-1].to(device, non_blocking=True)
+                with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
+                    outputs = model(*(prepare_images(images, device) for images in batch[:-1]))
+                outputs = outputs.float()
                 loss = criterion(outputs, targets)
                 val_loss += loss.item() * targets.size(0)
                 probs = torch.softmax(outputs, dim=1).cpu().numpy()
@@ -431,6 +621,15 @@ def train_model(
 
         scheduler.step()
 
+        if epoch_callback is not None:
+            try:
+                epoch_callback(epoch, metrics["macro_f1"])
+            except BaseException:  # e.g. optuna.TrialPruned
+                if writer is not None:
+                    writer.close()
+                release_loaders(train_loader, val_loader)
+                raise
+
     if writer is not None:
         writer.flush()
         writer.close()
@@ -438,7 +637,8 @@ def train_model(
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    eval_metrics = evaluate_model(model, val_loader, device, class_names, is_board_model=(mode == "board"))
+    eval_metrics = evaluate_model(model, val_loader, device, class_names, is_board_model=(mode == "board"), use_amp=use_amp)
+    release_loaders(train_loader, val_loader)
 
     if save_trial_artifacts:
         torch.save({k: v.cpu().clone() for k, v in model.state_dict().items()}, output_root / "model_best.pt")
@@ -486,6 +686,12 @@ def objective(
     image_size: int = 224,
     num_workers: int = 2,
     cuda_device_index: int = 0,
+    subset_fraction: float = 1.0,
+    image_cache_dir: str | None = None,
+    image_scale: float = DEFAULT_IMAGE_SCALE,
+    canvas: Tuple[int, int] = DEFAULT_CANVAS,
+    two_side_fusion: str = "shared",
+    init_checkpoint: str | None = None,
 ):
     if search_space is None:
         search_space = {
@@ -496,6 +702,10 @@ def objective(
         }
 
     params = {}
+    if init_checkpoint:
+        # The encoder is fixed by the 1-side checkpoint the board model starts from.
+        search_space = {k: v for k, v in search_space.items() if k != "encoder_name"}
+        params["encoder_name"] = encoder_from_checkpoint(init_checkpoint)
     for key, spec in search_space.items():
         if key == "lr":
             params[key] = trial.suggest_float("lr", float(spec["low"]), float(spec["high"]), log=bool(spec.get("log", False)))
@@ -507,6 +717,11 @@ def objective(
             params[key] = trial.suggest_categorical("encoder_name", list(spec))
         else:
             raise ValueError(f"Unsupported Optuna search key: {key}")
+
+    def report_and_prune(epoch: int, macro_f1: float) -> None:
+        trial.report(macro_f1, epoch)
+        if trial.should_prune():
+            raise optuna.TrialPruned()
 
     run_dir = Path(output_root) / f"trial_{trial.number}"
     result = train_model(
@@ -530,6 +745,13 @@ def objective(
         image_size=image_size,
         num_workers=num_workers,
         cuda_device_index=cuda_device_index,
+        image_cache_dir=image_cache_dir,
+        subset_fraction=subset_fraction,
+        epoch_callback=report_and_prune,
+        image_scale=image_scale,
+        canvas=canvas,
+        two_side_fusion=two_side_fusion,
+        init_checkpoint=init_checkpoint,
     )
     trial.set_user_attr("macro_f1", result["metrics"]["macro_f1"])
     trial.set_user_attr("accuracy", result["metrics"]["accuracy"])
@@ -552,7 +774,14 @@ def run_optuna_tuning(
     image_size: int = 224,
     num_workers: int = 2,
     cuda_device_index: int = 0,
+    subset_fraction: float = 1.0,
+    image_cache_dir: str | None = None,
+    image_scale: float = DEFAULT_IMAGE_SCALE,
+    canvas: Tuple[int, int] = DEFAULT_CANVAS,
+    two_side_fusion: str = "shared",
+    init_checkpoint: str | None = None,
 ):
+    """Tune with Optuna; ``subset_fraction`` < 1 tunes on a stratified subset of boards for speed."""
     output_root = Path(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
     study_name = study_name or f"nhla_{mode}_tuning_{datetime.now():%Y%m%d_%H%M%S}"
@@ -562,7 +791,8 @@ def run_optuna_tuning(
         study_name=study_name,
         storage=storage,
         sampler=optuna.samplers.TPESampler(seed=seed),
-        pruner=optuna.pruners.MedianPruner(),
+        pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=3),
+        load_if_exists=True,
     )
     study.optimize(
         lambda trial: objective(
@@ -578,11 +808,20 @@ def run_optuna_tuning(
             image_size=image_size,
             num_workers=num_workers,
             cuda_device_index=cuda_device_index,
+            subset_fraction=subset_fraction,
+            image_cache_dir=image_cache_dir,
+            image_scale=image_scale,
+            canvas=canvas,
+            two_side_fusion=two_side_fusion,
+            init_checkpoint=init_checkpoint,
         ),
         n_trials=n_trials,
+        gc_after_trial=True,
     )
 
     best_params = dict(study.best_params)
+    if init_checkpoint:
+        best_params["encoder_name"] = encoder_from_checkpoint(init_checkpoint)
     best_params_path = output_root / "best_params.json"
     with best_params_path.open("w") as fh:
         json.dump(best_params, fh, indent=2)

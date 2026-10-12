@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from notebooks.NHLA_Classification import run_optuna_tuning, train_model
+from notebooks.NHLA_Classification import DEFAULT_CANVAS, DEFAULT_IMAGE_SCALE, run_optuna_tuning, train_model
 
 
 def train_1side(
@@ -34,6 +34,11 @@ def train_1side(
     tensorboard_dir: str | None = None,
     metrics_dir: str | None = None,
     checkpoint_interval: int = 5,
+    num_workers: int = 2,
+    tune_subset_fraction: float = 1.0,
+    image_cache_dir: str | None = None,
+    image_scale: float = DEFAULT_IMAGE_SCALE,
+    canvas: tuple = DEFAULT_CANVAS,
 ):
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -59,6 +64,11 @@ def train_1side(
             search_space=search_space,
             study_name=study_name,
             db_path=db_path,
+            num_workers=num_workers,
+            subset_fraction=tune_subset_fraction,
+            image_cache_dir=image_cache_dir,
+            image_scale=image_scale,
+            canvas=canvas,
         )
         print(f"Best 1-side Optuna params: {best_params}")
 
@@ -83,6 +93,10 @@ def train_1side(
         metrics_dir=metrics_dir,
         checkpoint_interval=checkpoint_interval,
         save_trial_artifacts=True,
+        num_workers=num_workers,
+        image_cache_dir=image_cache_dir,
+        image_scale=image_scale,
+        canvas=canvas,
     )
 
     params_path = Path(metrics_dir) / "best_params.json" if metrics_dir is not None else output_root / "best_params.json"
@@ -113,6 +127,11 @@ def main():
     parser.add_argument("--tensorboard-dir", type=str, default=None, help="Optional directory for TensorBoard logs")
     parser.add_argument("--metrics-dir", type=str, default=None, help="Optional directory for metrics and CSV/PNG outputs")
     parser.add_argument("--checkpoint-interval", type=int, default=5, help="Save periodic checkpoints every N epochs")
+    parser.add_argument("--num-workers", type=int, default=2, help="DataLoader worker processes")
+    parser.add_argument("--tune-subset-fraction", type=float, default=1.0, help="Fraction of boards (label-stratified) used for Optuna trials")
+    parser.add_argument("--image-cache-dir", type=str, default=None, help="Root for the decoded image cache (default ~/.cache/nhla_images or $NHLA_CACHE_DIR)")
+    parser.add_argument("--image-scale", type=float, default=DEFAULT_IMAGE_SCALE, help="Fixed resize factor applied to every face (native is 1 mm/px along the board)")
+    parser.add_argument("--canvas", type=int, nargs=2, default=list(DEFAULT_CANVAS), metavar=("HEIGHT", "WIDTH"), help="Padded input size")
     args = parser.parse_args()
 
     output = train_1side(
@@ -131,6 +150,11 @@ def main():
         tensorboard_dir=args.tensorboard_dir,
         metrics_dir=args.metrics_dir,
         checkpoint_interval=args.checkpoint_interval,
+        num_workers=args.num_workers,
+        tune_subset_fraction=args.tune_subset_fraction,
+        image_cache_dir=args.image_cache_dir,
+        image_scale=args.image_scale,
+        canvas=tuple(args.canvas),
     )
     print(json.dumps({"best_params": output["best_params"], "metrics": output["result"]["metrics"]}, indent=2))
 

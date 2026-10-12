@@ -6,6 +6,7 @@ from tqdm import tqdm
 import numpy as np
 import json
 from sklearn.model_selection import train_test_split
+from functions.mask_filenames import parse_class_mask_filename
 
 
 
@@ -29,9 +30,9 @@ def analyze_dataset(folder_path):
         stats['total_files'] += 1
         filename = file.name
         
-        if "_Bin_" in filename:
-            # Extract class name
-            class_name = filename.split("_Bin_")[1].replace(".tif", "")
+        parsed_mask = parse_class_mask_filename(file)
+        if parsed_mask is not None:
+            _image_stem, class_name = parsed_mask
             stats['masks_by_class'][class_name].append(filename)
         elif "_Col.tif" in filename:
             stats['color_images'].append(filename)
@@ -94,9 +95,12 @@ def reorganize_dataset(source_folder, output_folder):
             shutil.copy2(file, images_dir / filename)
             stats['images'] += 1
         
-        # Copy Col masks (contains _Col_Bin_ but NOT _Lum_Bin_)
-        elif "_Col_Bin_" in filename and "_Lum_Bin_" not in filename:
-            class_name = filename.split("_Col_Bin_")[1].replace(".tif", "")
+        # Copy class masks in legacy and current color-mask naming formats.
+        else:
+            parsed_mask = parse_class_mask_filename(file)
+            if parsed_mask is None:
+                continue
+            _image_stem, class_name = parsed_mask
             class_dir = masks_dir / class_name
             class_dir.mkdir(exist_ok=True)
             
@@ -129,8 +133,16 @@ def validate_dataset(organized_folder):
     # Get all images
     image_files = sorted(images_dir.glob("*.tif"))
     
-    # Get all mask classes
+    # Get all mask classes and index masks by the exact paired image stem.
     mask_classes = [d.name for d in masks_dir.iterdir() if d.is_dir()]
+    masks_by_image = defaultdict(lambda: defaultdict(list))
+    for class_name in mask_classes:
+        for mask_file in (masks_dir / class_name).glob("*.tif*"):
+            parsed_mask = parse_class_mask_filename(mask_file)
+            if parsed_mask is not None:
+                image_stem, parsed_class = parsed_mask
+                if parsed_class == class_name:
+                    masks_by_image[image_stem][class_name].append(mask_file)
     
     print("="*60)
     print("DATASET VALIDATION")
@@ -144,13 +156,12 @@ def validate_dataset(organized_folder):
     
     for img_file in image_files:
         # Extract base name
-        base_name = img_file.stem.replace("_Col", "")
+        image_stem = img_file.stem
         
         # Find corresponding masks
         masks_found = {}
         for class_name in mask_classes:
-            mask_pattern = f"*{base_name}*_Bin_{class_name}.tif"
-            mask_files = list((masks_dir / class_name).glob(mask_pattern))
+            mask_files = masks_by_image[image_stem].get(class_name, [])
             
             if mask_files:
                 masks_found[class_name] = mask_files[0]
@@ -271,9 +282,17 @@ def create_combined_masks(organized_folder):
     combined_masks_dir = base_path / "combined_masks"
     combined_masks_dir.mkdir(exist_ok=True)
     
-    # Get mask classes
+    # Get mask classes and index masks by the exact paired image stem.
     mask_classes = sorted([d.name for d in masks_dir.iterdir() if d.is_dir()])
     class_mapping = {class_name: idx + 1 for idx, class_name in enumerate(mask_classes)}
+    masks_by_image = defaultdict(lambda: defaultdict(list))
+    for class_name in mask_classes:
+        for mask_file in (masks_dir / class_name).glob("*.tif*"):
+            parsed_mask = parse_class_mask_filename(mask_file)
+            if parsed_mask is not None:
+                image_stem, parsed_class = parsed_mask
+                if parsed_class == class_name:
+                    masks_by_image[image_stem][class_name].append(mask_file)
     
     print("="*60)
     print("CREATING COMBINED MASKS")
@@ -288,7 +307,7 @@ def create_combined_masks(organized_folder):
     image_files = sorted(images_dir.glob("*.tif"))
     
     for img_file in tqdm(image_files, desc="Processing"):
-        base_name = img_file.stem.replace("_Col", "")
+        image_stem = img_file.stem
         
         # Load image to get dimensions
         img = Image.open(img_file)
@@ -299,8 +318,7 @@ def create_combined_masks(organized_folder):
         
         # Overlay each class mask
         for class_name, class_idx in class_mapping.items():
-            mask_pattern = f"*{base_name}*_Bin_{class_name}.tif"
-            mask_files = list((masks_dir / class_name).glob(mask_pattern))
+            mask_files = masks_by_image[image_stem].get(class_name, [])
             
             if mask_files:
                 mask = np.array(Image.open(mask_files[0]))
@@ -313,7 +331,7 @@ def create_combined_masks(organized_folder):
                 combined_mask[mask > 127] = class_idx
         
         # Save combined mask
-        output_file = combined_masks_dir / f"{base_name}_mask.png"
+        output_file = combined_masks_dir / f"{image_stem.removesuffix('_Col')}_mask.png"
         Image.fromarray(combined_mask).save(output_file)
     
     print(f"\nCombined masks saved to: {combined_masks_dir}")
@@ -331,7 +349,7 @@ def create_train_val_split(organized_folder, val_split=0.2, test_split=0.0, seed
     images_dir = base_path / "images"
 
     # all image ids (without _Col)
-    image_files = sorted([f.stem.replace("_Col", "") for f in images_dir.glob("*.tif")])
+    image_files = sorted([f.stem.removesuffix("_Col") for f in images_dir.glob("*.tif")])
 
     # if no test split, do simple train/val
     if test_split and test_split > 0.0:

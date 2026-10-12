@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
+from multiprocessing import Pool
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 import xml.etree.ElementTree as ET
@@ -23,6 +25,7 @@ DEFAULT_GRADE_MAP = {
     6: "Select",
     7: "F1F",
     8: "FAS",
+    9: "Cull",
 }
 
 FACE_KEYWORDS = {
@@ -54,43 +57,30 @@ def _find_element_text(root: ET.Element, tags: Iterable[str]) -> Optional[str]:
     return None
 
 
+def _tag_value(root: ET.Element, tag: str) -> Optional[int]:
+    for element in root.iter(tag):
+        value = safe_int(element.text)
+        if value is not None:
+            return value
+    return None
+
+
 def _find_grade_value(root: ET.Element, face: str, validation: bool = False) -> Optional[int]:
+    """Grade for one face.
+
+    ``validation=True`` reads only the per-face grader tag (``NHLA_Grade_Validation_Top/Bot``).
+    The board-level ``NHLA_Grade_Validation`` is a grade for the whole board, not for one face,
+    so it's never used as a face label. ``validation=False`` reads the per-face vision tag,
+    falling back to the board vision grade only when the XML has no per-face vision tag.
+    """
     suffix = "Top" if face == "top" else "Bot"
-    tag_names = [
-        f"NHLA_Grade_Validation_{suffix}",
-        f"NHLA_Grade_Vision_{suffix}",
-        f"NHLA_Grade_Validation",
-        f"NHLA_Grade_Vision",
-    ]
-    if validation:
-        tag_names = [
-            f"NHLA_Grade_Validation_{suffix}",
-            f"NHLA_Grade_Validation",
-            f"NHLA_Grade_Vision_{suffix}",
-            f"NHLA_Grade_Vision",
-        ]
+    tag_names = [f"NHLA_Grade_Validation_{suffix}"] if validation else [f"NHLA_Grade_Vision_{suffix}", "NHLA_Grade_Vision"]
 
     for tag_name in tag_names:
-        for element in root.iter(tag_name):
-            value = safe_int(element.text)
-            if value is None:
-                continue
-            if validation and value == 0:
-                continue
-            return value
-
-    if validation:
-        return None
-
-    # If the XML has only a zero-valued validation tag and no vision tag,
-    # we still want the vision value to be considered valid when the grader
-    # hasn't overridden it.
-    for tag_name in [f"NHLA_Grade_Vision_{suffix}", "NHLA_Grade_Vision"]:
-        for element in root.iter(tag_name):
-            value = safe_int(element.text)
-            if value is not None:
-                return value
-
+        value = _tag_value(root, tag_name)
+        if value is None or (validation and value == 0):
+            continue
+        return value
     return None
 
 
@@ -262,13 +252,91 @@ def _board_metadata_from_xml(xml_path: Path) -> Dict[str, object]:
     }
 
 
+def vision_validated(board_vision_value: Optional[int], board_validation_value: Optional[int]) -> bool:
+    """True when the grader's board grade confirms the vision system's board grade."""
+    return board_validation_value is not None and board_validation_value > 0 and board_vision_value == board_validation_value
+
+
+def _parse_board_xml(xml_file: Path) -> Optional[Dict[str, object]]:
+    try:
+        root_element = ET.parse(xml_file).getroot()
+    except ET.ParseError:
+        return None
+
+    faces = {}
+    for face in ("top", "bottom"):
+        raw_value, _, source = resolve_grade_for_face(root_element, face)
+        faces[face] = (raw_value, source)
+
+    board_grade_raw, _, board_grade_source = resolve_board_grade(root_element)
+    board_vision = _tag_value(root_element, "NHLA_Grade_Vision")
+    board_validation = _tag_value(root_element, "NHLA_Grade_Validation")
+    return {
+        "xml_path": xml_file,
+        "faces": faces,
+        "board_grade_value": board_grade_raw,
+        "board_grade_source": board_grade_source,
+        "board_vision_value": board_vision,
+        "board_validation_value": board_validation,
+        "vision_validated": vision_validated(board_vision, board_validation),
+    }
+
+
+FACE_FIELDS = [
+    "board_id",
+    "face",
+    "image_path",
+    "grade_value",
+    "grade_label",
+    "grade_source",
+    "board_grade_value",
+    "board_grade_label",
+    "board_grade_source",
+    "board_vision_value",
+    "board_validation_value",
+    "vision_validated",
+    "xml_path",
+]
+BOARD_FIELDS = [
+    "board_id",
+    "top_image_path",
+    "bottom_image_path",
+    "top_grade_value",
+    "top_grade_label",
+    "bottom_grade_value",
+    "bottom_grade_label",
+    "board_grade_value",
+    "board_grade_label",
+    "board_grade_source",
+    "board_vision_value",
+    "board_validation_value",
+    "vision_validated",
+    "xml_path",
+]
+
+
+def _write_csv(path: Path, fieldnames: List[str], rows: List[Dict[str, object]]) -> None:
+    with path.open("w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 def build_nhla_grade_dataset(
     scan_root: str,
     output_dir: Optional[str] = None,
     grade_map: Optional[Dict[int, str]] = None,
     save_csvs: bool = True,
+    num_workers: Optional[int] = None,
 ) -> Dict[str, List[Dict[str, object]]]:
-    """Assemble side-level and board-level CSV data from a folder of XML + images."""
+    """Assemble side-level and board-level CSV data from a folder of XML + images.
+
+    Writes ``nhla_face_labels.csv``, ``nhla_board_labels.csv`` and
+    ``nhla_face_labels_validated.csv``. The validated file keeps only faces of boards
+    where the grader's board grade equals the vision board grade (``vision_validated``),
+    labelled with the per-face vision grade. The grader only validates whole boards, so
+    this is the closest available stand-in for verified face labels.
+    """
     root = Path(scan_root).expanduser().resolve()
     if not root.exists():
         raise FileNotFoundError(f"Scan directory does not exist: {scan_root}")
@@ -278,23 +346,37 @@ def build_nhla_grade_dataset(
     image_index = _index_images_by_board(image_files)
     grade_map = DEFAULT_GRADE_MAP if grade_map is None else grade_map
 
+    if len(xml_files) >= 1000:
+        with Pool(num_workers or max(1, (os.cpu_count() or 2) - 2)) as pool:
+            parsed = pool.map(_parse_board_xml, xml_files, chunksize=256)
+    else:
+        parsed = [_parse_board_xml(xml_file) for xml_file in xml_files]
+
     face_rows: List[Dict[str, object]] = []
     board_rows: List[Dict[str, object]] = []
 
-    for xml_file in xml_files:
-        try:
-            tree = ET.parse(xml_file)
-        except ET.ParseError:
+    for info in parsed:
+        if info is None:
             continue
-
-        root_element = tree.getroot()
+        xml_file = info["xml_path"]
         board_id = _board_stem_from_xml(xml_file)
-        board_grade_raw, board_grade_label, board_grade_source = resolve_board_grade(root_element, grade_map)
+        board_grade_raw = info["board_grade_value"]
+        board_grade_label = grade_label_from_value(board_grade_raw, grade_map)
         board_images = image_index.get(board_id.lower(), {})
+        shared = {
+            "board_grade_value": board_grade_raw,
+            "board_grade_label": board_grade_label,
+            "board_grade_source": info["board_grade_source"],
+            "board_vision_value": info["board_vision_value"],
+            "board_validation_value": info["board_validation_value"],
+            "vision_validated": info["vision_validated"],
+            "xml_path": str(xml_file),
+        }
 
         face_grades: Dict[str, Tuple[Optional[int], str]] = {}
         for face in ("top", "bottom"):
-            grade_raw, grade_label, grade_source = resolve_grade_for_face(root_element, face, grade_map)
+            grade_raw, grade_source = info["faces"][face]
+            grade_label = grade_label_from_value(grade_raw, grade_map)
             face_image = board_images.get(face)
             face_grades[face] = (grade_raw, grade_label)
             face_rows.append({
@@ -304,10 +386,7 @@ def build_nhla_grade_dataset(
                 "grade_value": grade_raw,
                 "grade_label": grade_label,
                 "grade_source": grade_source,
-                "board_grade_value": board_grade_raw,
-                "board_grade_label": board_grade_label,
-                "board_grade_source": board_grade_source,
-                "xml_path": str(xml_file),
+                **shared,
             })
 
         top_image = board_images.get("top")
@@ -323,74 +402,40 @@ def build_nhla_grade_dataset(
             "top_grade_label": top_grade_label,
             "bottom_grade_value": bottom_grade_value,
             "bottom_grade_label": bottom_grade_label,
-            "board_grade_value": board_grade_raw,
-            "board_grade_label": board_grade_label,
-            "board_grade_source": board_grade_source,
-            "xml_path": str(xml_file),
+            **shared,
         })
+
+    validated_face_rows = [
+        row for row in face_rows
+        if row["vision_validated"] and row["image_path"] and row["grade_value"] is not None
+    ]
 
     if save_csvs:
         output = Path(output_dir).expanduser().resolve() if output_dir is not None else (root / "nhla_dataset").resolve()
         output.mkdir(parents=True, exist_ok=True)
 
-        face_csv = output / "nhla_face_labels.csv"
-        board_csv = output / "nhla_board_labels.csv"
-
-        with face_csv.open("w", newline="") as fh:
-            writer = csv.DictWriter(
-                fh,
-                fieldnames=[
-                    "board_id",
-                    "face",
-                    "image_path",
-                    "grade_value",
-                    "grade_label",
-                    "grade_source",
-                    "board_grade_value",
-                    "board_grade_label",
-                    "board_grade_source",
-                    "xml_path",
-                ],
-            )
-            writer.writeheader()
-            writer.writerows(face_rows)
-
-        with board_csv.open("w", newline="") as fh:
-            writer = csv.DictWriter(
-                fh,
-                fieldnames=[
-                    "board_id",
-                    "top_image_path",
-                    "bottom_image_path",
-                    "top_grade_value",
-                    "top_grade_label",
-                    "bottom_grade_value",
-                    "bottom_grade_label",
-                    "board_grade_value",
-                    "board_grade_label",
-                    "board_grade_source",
-                    "xml_path",
-                ],
-            )
-            writer.writeheader()
-            writer.writerows(board_rows)
+        _write_csv(output / "nhla_face_labels.csv", FACE_FIELDS, face_rows)
+        _write_csv(output / "nhla_board_labels.csv", BOARD_FIELDS, board_rows)
+        _write_csv(output / "nhla_face_labels_validated.csv", FACE_FIELDS, validated_face_rows)
 
         grade_map_path = output / "grade_mapping.json"
         with grade_map_path.open("w") as fh:
             json.dump({str(k): v for k, v in grade_map.items()}, fh, indent=2)
 
-    return {"faces": face_rows, "boards": board_rows}
+    return {"faces": face_rows, "boards": board_rows, "validated_faces": validated_face_rows}
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build NHLA grade CSVs from a folder of XML and board images.")
     parser.add_argument("--scan-root", required=True, help="Folder containing XML files and board images.")
     parser.add_argument("--output-dir", default=None, help="Directory to write output CSVs. Defaults to scan-root/nhla_dataset.")
+    parser.add_argument("--num-workers", type=int, default=None, help="Processes used to parse XML files (default: CPU count - 2).")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = _parse_args()
-    rows = build_nhla_grade_dataset(args.scan_root, args.output_dir)
+    rows = build_nhla_grade_dataset(args.scan_root, args.output_dir, num_workers=args.num_workers)
     print(f"Face rows: {len(rows['faces'])}")
     print(f"Board rows: {len(rows['boards'])}")
+    print(f"Validated face rows: {len(rows['validated_faces'])}")

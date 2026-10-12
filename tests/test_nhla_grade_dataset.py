@@ -73,6 +73,48 @@ def test_validation_overrides_vision(tmp_path):
     assert bottom["grade_source"] == "validation"
 
 
+def _write_board(root, board, vision, top, bot, validation):
+    (root / f"{board}.xml").write_text(
+        f"""<?xml version=\"1.0\" encoding=\"utf-8\"?>
+<NHLA_BoardInfo>
+  <NHLA_Grade_Vision>{vision}</NHLA_Grade_Vision>
+  <NHLA_Grade_Vision_Top>{top}</NHLA_Grade_Vision_Top>
+  <NHLA_Grade_Vision_Bot>{bot}</NHLA_Grade_Vision_Bot>
+  <NHLA_Grade_Validation>{validation}</NHLA_Grade_Validation>
+</NHLA_BoardInfo>
+"""
+    )
+    (root / f"{board}_Top.jpg").write_bytes(b"fake")
+    (root / f"{board}_Bot.jpg").write_bytes(b"fake")
+
+
+def test_board_validation_is_not_used_as_face_grade(tmp_path):
+    # Real scanner exports carry only a board-level validation grade.
+    _write_board(tmp_path, "B010_2025-08-18_10.02.34.808", vision=7, top=5, bot=7, validation=5)
+
+    rows = build_nhla_grade_dataset(str(tmp_path), str(tmp_path / "nhla_dataset"))
+    faces = {r["face"]: r for r in rows["faces"]}
+
+    assert faces["top"]["grade_label"] == "1 Com"
+    assert faces["bottom"]["grade_label"] == "F1F"
+    assert faces["bottom"]["grade_source"] == "vision"
+    assert rows["boards"][0]["board_grade_label"] == "1 Com"
+    assert rows["boards"][0]["vision_validated"] is False
+
+
+def test_validated_face_csv_keeps_only_boards_where_grader_agrees(tmp_path):
+    _write_board(tmp_path, "B011_2025-08-18_10.02.34.808", vision=5, top=5, bot=4, validation=5)
+    _write_board(tmp_path, "B012_2025-08-18_10.02.36.604", vision=7, top=7, bot=7, validation=4)
+    _write_board(tmp_path, "B013_2025-08-18_10.02.38.100", vision=4, top=4, bot=4, validation=0)
+
+    rows = build_nhla_grade_dataset(str(tmp_path), str(tmp_path / "nhla_dataset"))
+
+    validated = pd.read_csv(tmp_path / "nhla_dataset" / "nhla_face_labels_validated.csv")
+    assert set(validated["board_id"]) == {"B011_2025-08-18_10.02.34.808"}
+    assert dict(zip(validated["face"], validated["grade_label"])) == {"top": "1 Com", "bottom": "2A Com"}
+    assert len(rows["validated_faces"]) == 2
+
+
 def test_relative_scan_root_generates_absolute_image_paths(tmp_path, monkeypatch):
     project_root = tmp_path / "project_root"
     project_root.mkdir()
@@ -135,6 +177,7 @@ def test_optuna_tuning_smoke(tmp_path):
         epochs=1,
         seed=42,
         val_split=0.5,
+        image_cache_dir=str(tmp_path / "cache"),
     )
 
     assert len(study.trials) == 1

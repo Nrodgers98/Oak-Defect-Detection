@@ -1,0 +1,24 @@
+# Theme for the model dashboard. Streamlit reads .streamlit/ from the working
+# directory, so launch from here:  cd notebooks/dashboard && streamlit run Home.py --server.port 8502
+
+[theme]
+base = "dark"
+primaryColor = "#E0A040"
+backgroundColor = "#141413"
+secondaryBackgroundColor = "#1d1d1b"
+textColor = "#f4f3ee"
+borderColor = "#2e2e2b"
+font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap, sans-serif"
+codeFont = "'JetBrains Mono':https://fonts.googleapis.com/css2?family=JetBrains+Mono&display=swap, monospace"
+baseRadius = "medium"
+chartCategoricalColors = ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300", "#9085e9", "#e66767"]
+
+[server]
+headless = true
+port = 8502
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"

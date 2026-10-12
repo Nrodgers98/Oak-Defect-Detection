@@ -10,6 +10,7 @@ This app allows users to:
 import streamlit as st
 import sys
 from pathlib import Path
+from typing import Mapping, Optional
 import numpy as np
 from PIL import Image
 
@@ -25,6 +26,30 @@ try:
     import onnxruntime as ort
 except ImportError:
     ort = None
+
+
+@st.cache_data(show_spinner=False)
+def get_model_class_count(model_path: str, backend: str) -> int:
+    """Return the selected model's number of segmentation output classes."""
+    if backend == "ONNX (.onnx)":
+        if ort is None:
+            raise RuntimeError("ONNX Runtime is not available")
+        session = ort.InferenceSession(model_path)
+        output_shape = session.get_outputs()[0].shape
+        if len(output_shape) < 2 or not isinstance(output_shape[1], (int, np.integer)):
+            raise ValueError("Could not determine the ONNX model's output class count")
+        return int(output_shape[1])
+
+    import torch
+
+    checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
+    if isinstance(checkpoint, dict) and isinstance(checkpoint.get("num_classes"), int):
+        return int(checkpoint["num_classes"])
+    state_dict = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+    for key, value in state_dict.items():
+        if "segmentation_head.0.weight" in key or "segmentation_head.weight" in key:
+            return int(value.shape[0])
+    raise ValueError("Could not determine the PyTorch model's output class count")
 
 # Page configuration
 st.set_page_config(
@@ -130,6 +155,19 @@ with st.sidebar:
         stride = None
         batch_size = 4
 
+    st.subheader("Tiled / Crop-Based Inference")
+    use_tiled = st.checkbox(
+        "Enable Tiled Inference",
+        value=False,
+        help="Crop the original board before inference and stitch tile predictions back together.",
+    )
+    max_crop_width = st.number_input(
+        "Max Crop Width (X)", min_value=1, max_value=20000, value=3000, step=100
+    )
+    max_crop_height = st.number_input(
+        "Max Crop Height (Y)", min_value=1, max_value=20000, value=1000, step=100
+    )
+
 # Main content area
 col1, col2 = st.columns(2)
 
@@ -140,9 +178,15 @@ with col1:
     model_files = []
     if models_dir.exists():
         if backend == "PyTorch (.pt/.pth)":
-            # Look for PyTorch checkpoints in all model subfolders except ONNX folder
+            # Look for segmentation checkpoints in model subfolders; skip ONNX exports and
+            # YOLO / NHLA runs, which this app can't load
+            non_segmentation = ("yolo", "nhla")
             for model_folder in models_dir.iterdir():
-                if model_folder.is_dir() and model_folder.name != "onnx":
+                if (
+                    model_folder.is_dir()
+                    and model_folder.name != "onnx"
+                    and not any(tag in model_folder.name.lower() for tag in non_segmentation)
+                ):
                     for model_file in model_folder.glob("*.pt"):
                         model_files.append(model_file)
                     # Also check for .pth files
@@ -187,6 +231,38 @@ with col1:
     else:
         st.error(f"✗ Model file not found: {full_model_path}")
 
+try:
+    model_class_count = get_model_class_count(str(full_model_path), backend)
+except Exception as e:
+    st.error(f"Could not determine the selected model's class count: {e}")
+    st.stop()
+
+with st.sidebar:
+    st.subheader("Class Names and Minimum Confidence")
+    class_names = []
+    confidence_thresholds = {}
+    for class_id in range(model_class_count):
+        default_name = (
+            pred_module.CLASS_NAMES[class_id]
+            if class_id < len(pred_module.CLASS_NAMES)
+            else f"Class {class_id}"
+        )
+        class_name = st.text_input(
+            f"Class {class_id} name",
+            value=default_name,
+            key=f"class_name_{class_id}",
+        ).strip() or f"Class {class_id}"
+        class_names.append(class_name)
+        if class_id > 0:
+            confidence_thresholds[class_id] = float(st.number_input(
+                f"{class_name} minimum score (%)",
+                min_value=0,
+                max_value=100,
+                value=0,
+                step=1,
+                key=f"class_threshold_{class_id}",
+            ))
+
 with col2:
     st.header("Image Selection")
     
@@ -217,6 +293,20 @@ with col2:
     selected_image_path = image_options[selected_image_name]
     
     st.info(f"**Selected Image:** `{selected_image_name}`")
+
+    if use_tiled and selected_image_path.exists():
+        try:
+            image_width, image_height = Image.open(selected_image_path).size
+            tile_columns = int(np.ceil(image_width / max_crop_width))
+            tile_rows = int(np.ceil(image_height / max_crop_height))
+            tile_count = tile_columns * tile_rows
+            st.metric(
+                "Tiled inference",
+                f"{tile_columns}x{tile_rows} = {tile_count} tiles",
+                help="The original image is cropped before preprocessing.",
+            )
+        except Exception as e:
+            st.warning(f"Could not calculate tile breakdown: {e}")
     
     # Display selected image
     if selected_image_path.exists():
@@ -236,7 +326,11 @@ def get_onnx_session(model_path: str):
     )
 
 
-def predict_with_onnx(image_path: str, onnx_model_path: str):
+def predict_with_onnx_array(
+    image: np.ndarray,
+    onnx_model_path: str,
+    return_probabilities: bool = False,
+):
     """
     Run inference with an ONNX model.
 
@@ -254,20 +348,38 @@ def predict_with_onnx(image_path: str, onnx_model_path: str):
     input_name = inp_meta.name
     onnx_type = (getattr(inp_meta, "type", None) or "").lower()
     expects_uint8 = "uint8" in onnx_type
+    inference_image = image
 
-    # Load image as RGB numpy array [H, W, 3] uint8
-    image = load_image(image_path)
+    input_shape = getattr(inp_meta, "shape", None)
+    if input_shape and len(input_shape) >= 4:
+        expected_height, expected_width = input_shape[-2:]
+        if (
+            isinstance(expected_height, (int, np.integer))
+            and isinstance(expected_width, (int, np.integer))
+            and expected_height > 0
+            and expected_width > 0
+            and image.shape[:2] != (expected_height, expected_width)
+        ):
+            inference_image = np.asarray(
+                Image.fromarray(image).resize(
+                    (int(expected_width), int(expected_height)),
+                    resample=Image.BILINEAR,
+                )
+            )
 
     if expects_uint8:
         # ── uint8 NCHW (preprocessing may be inside the ONNX graph) ─────────
-        img_chw = np.transpose(image, (2, 0, 1))[np.newaxis, ...]  # [1, 3, H, W]
+        img_chw = np.transpose(inference_image, (2, 0, 1))[np.newaxis, ...]  # [1, 3, H, W]
         img_input = img_chw.astype(np.uint8, copy=False)
 
         outputs = session.run(None, {input_name: img_input})[0]  # [1, C, H, W]
-        pred = outputs.argmax(axis=1)[0].astype(np.uint8)
+        prob_map = np.asarray(outputs[0], dtype=np.float32)
+        if np.nanmax(prob_map) > 1.0:
+            prob_map = prob_map / 100.0
+        prob_map = np.clip(prob_map, 0.0, 1.0)
     else:
         # ── Float preprocessed input (e.g. tensor(float)) ─────────
-        img_tensor = pred_module.preprocess_image(image, device="cpu")
+        img_tensor = pred_module.preprocess_image(inference_image, device="cpu")
         inputs = img_tensor.numpy()  # [1, 3, H, W]
 
         outputs = session.run(None, {input_name: inputs})[0]  # [1, C, H, W]
@@ -276,17 +388,65 @@ def predict_with_onnx(image_path: str, onnx_model_path: str):
         logits = logits - logits.max(axis=1, keepdims=True)
         exp_logits = np.exp(logits)
         probs = exp_logits / exp_logits.sum(axis=1, keepdims=True)
-        pred = probs.argmax(axis=1)[0].astype(np.uint8)
+        prob_map = probs[0].astype(np.float32)
 
     # ONNX graphs may emit H×W that differs slightly from the file (padding / fixed stride).
     h, w = image.shape[:2]
-    if pred.shape[0] != h or pred.shape[1] != w:
-        pred = np.asarray(
-            Image.fromarray(pred, mode="L").resize((w, h), resample=Image.NEAREST),
-            dtype=np.uint8,
-        )
+    if prob_map.shape[1:] != (h, w):
+        prob_map = np.stack([
+            np.asarray(
+                Image.fromarray(class_map, mode="F").resize(
+                    (w, h), resample=Image.BILINEAR
+                ),
+                dtype=np.float32,
+            )
+            for class_map in prob_map
+        ])
 
+    pred = prob_map.argmax(axis=0).astype(np.uint8)
+    if return_probabilities:
+        return pred, prob_map
     return pred
+
+
+def predict_with_onnx(image_path: str, onnx_model_path: str):
+    """Run ONNX inference for an image path."""
+    return predict_with_onnx_array(load_image(image_path), onnx_model_path)
+
+
+def predict_with_onnx_tiled(
+    image: np.ndarray,
+    onnx_model_path: str,
+    max_crop_width: int = 3000,
+    max_crop_height: int = 1000,
+    confidence_thresholds: Optional[Mapping[int, float]] = None,
+) -> np.ndarray:
+    """Run ONNX inference on crops and reconstruct the native-size mask."""
+    crops, boxes = pred_module.tessellate_image(
+        image, max_crop_width, max_crop_height
+    )
+    height, width = image.shape[:2]
+    stitched_prob_map = None
+
+    for crop, (ymin, ymax, xmin, xmax) in zip(crops, boxes):
+        _, tile_prob_map = predict_with_onnx_array(
+            crop, onnx_model_path, return_probabilities=True
+        )
+        tile_height, tile_width = ymax - ymin, xmax - xmin
+        if tile_prob_map.shape[1:] != (tile_height, tile_width):
+            raise ValueError("ONNX tile probabilities do not match crop dimensions")
+        if stitched_prob_map is None:
+            stitched_prob_map = np.zeros(
+                (tile_prob_map.shape[0], height, width), dtype=np.float32
+            )
+        elif stitched_prob_map.shape[0] != tile_prob_map.shape[0]:
+            raise ValueError("All ONNX tiles must produce the same number of classes")
+        stitched_prob_map[:, ymin:ymax, xmin:xmax] = tile_prob_map
+
+    stitched_mask = stitched_prob_map.argmax(axis=0).astype(np.uint8)
+    return pred_module.apply_confidence_threshold(
+        stitched_mask, stitched_prob_map, confidence_thresholds
+    )
 
 
 # Prediction button
@@ -326,6 +486,10 @@ if predict_button:
                         tile_size=tile_size if use_patch else 512,
                         stride=stride if use_patch else None,
                         batch_size=batch_size if use_patch else 4,
+                        use_tiled=use_tiled,
+                        max_crop_width=int(max_crop_width),
+                        max_crop_height=int(max_crop_height),
+                        confidence_thresholds=confidence_thresholds,
                         num_classes=None,  # Auto-detect
                         encoder_name='resnet34',
                         device=device,
@@ -341,10 +505,24 @@ if predict_button:
                         raise FileNotFoundError(f"ONNX model not found: {onnx_model_path}")
                     
                     start_time = time.perf_counter()
-                    pred_mask = predict_with_onnx(
-                        image_path=str(selected_image_path),
-                        onnx_model_path=str(onnx_model_path),
-                    )
+                    original_image_for_prediction = load_image(str(selected_image_path))
+                    if use_tiled:
+                        pred_mask = predict_with_onnx_tiled(
+                            image=original_image_for_prediction,
+                            onnx_model_path=str(onnx_model_path),
+                            max_crop_width=int(max_crop_width),
+                            max_crop_height=int(max_crop_height),
+                            confidence_thresholds=confidence_thresholds,
+                        )
+                    else:
+                        pred_mask, prob_map = predict_with_onnx_array(
+                            image=original_image_for_prediction,
+                            onnx_model_path=str(onnx_model_path),
+                            return_probabilities=True,
+                        )
+                        pred_mask = pred_module.apply_confidence_threshold(
+                            pred_mask, prob_map, confidence_thresholds
+                        )
                     end_time = time.perf_counter()
                     inference_time_ms = (end_time - start_time) * 1000.0
         
@@ -352,7 +530,7 @@ if predict_button:
             original_image = load_image(str(selected_image_path))
             
             # Create overlay
-            overlay_image = visualize_prediction(original_image, pred_mask, alpha=alpha)
+            overlay_image = visualize_prediction(original_image, pred_mask, class_names=class_names, alpha=alpha)
             
             # Display results
             st.success("Prediction complete!")
@@ -373,7 +551,8 @@ if predict_button:
                 st.write("**Class Distribution:**")
                 for class_id, count in sorted(class_dist.items()):
                     percentage = (count / pred_mask.size) * 100
-                    st.write(f"- Class {class_id}: {count:,} pixels ({percentage:.2f}%)")
+                    class_name = class_names[class_id] if class_id < len(class_names) else f"Class {class_id}"
+                    st.write(f"- {class_name} (ID {class_id}): {count:,} pixels ({percentage:.2f}%)")
             
             with col_overlay:
                 st.subheader("Colored Overlay")
@@ -382,10 +561,15 @@ if predict_button:
                 
                 # Color legend
                 st.write("**Color Legend:**")
-                st.write("- **Blue**: Class 1")
-                st.write("- **Red**: Class 2")
-                st.write("- **Yellow**: Class 3")
-                st.write("- **Background**: Original image (transparent)")
+                st.write(f"- **Original image**: {class_names[0]} (ID 0, transparent)")
+                overlay_colors = ["Blue", "Red", "Yellow", "Green", "Magenta", "Cyan"]
+                for class_id in range(1, len(class_names)):
+                    color_name = (
+                        overlay_colors[class_id - 1]
+                        if class_id - 1 < len(overlay_colors)
+                        else f"Color {class_id}"
+                    )
+                    st.write(f"- **{color_name}**: {class_names[class_id]} (ID {class_id})")
                 
         except Exception as e:
             st.error(f"Error during prediction: {str(e)}")

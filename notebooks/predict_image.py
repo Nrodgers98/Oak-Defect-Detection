@@ -36,7 +36,7 @@ import numpy as np
 from PIL import Image
 import cv2
 from pathlib import Path
-from typing import Tuple, Optional, Union
+from typing import Mapping, Tuple, Optional, Union
 from datetime import datetime
 import segmentation_models_pytorch as smp
 import time
@@ -45,8 +45,33 @@ import time
 DEFAULT_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 DEFAULT_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
-# Class names for visualization
-CLASS_NAMES = ['Background', 'BlackRot', 'Knot', 'Stain']
+# Generic labels avoid assuming a checkpoint-specific class ordering.
+CLASS_NAMES = [f"Class {class_id}" for class_id in range(4)]
+
+
+def apply_confidence_threshold(
+    pred_mask: np.ndarray,
+    prob_map: np.ndarray,
+    thresholds: Optional[Mapping[int, float]] = None,
+) -> np.ndarray:
+    """Suppress low-confidence winning classes to background (class 0)."""
+    if thresholds is None:
+        return pred_mask
+    if prob_map.ndim != 3 or prob_map.shape[1:] != pred_mask.shape:
+        raise ValueError("prob_map must have shape (classes, height, width)")
+
+    thresholded_mask = pred_mask.copy()
+    for class_id, threshold_percent in thresholds.items():
+        if class_id < 0 or class_id >= prob_map.shape[0]:
+            raise ValueError(f"class_id {class_id} is outside the probability map")
+        if not 0 <= threshold_percent <= 100:
+            raise ValueError("confidence thresholds must be percentages from 0 to 100")
+        low_confidence = (
+            (thresholded_mask == class_id)
+            & (prob_map[class_id] < (threshold_percent / 100.0))
+        )
+        thresholded_mask[low_confidence] = 0
+    return thresholded_mask
 
 
 def load_image(image_path: Union[str, Path, any]) -> np.ndarray:
@@ -83,6 +108,29 @@ def preprocess_image(image: np.ndarray, mean: np.ndarray = DEFAULT_MEAN,
     # Convert to tensor and add batch dimension
     img_tensor = torch.from_numpy(img.transpose(2, 0, 1)).unsqueeze(0).to(device).float()
     return img_tensor
+
+
+def tessellate_image(
+    image: np.ndarray, max_x: int, max_y: int
+) -> Tuple[list, list]:
+    """Split an image into non-overlapping crops and native-coordinate boxes."""
+    if image.ndim < 2:
+        raise ValueError("image must have at least two dimensions (H, W)")
+    if not isinstance(max_x, (int, np.integer)) or max_x <= 0:
+        raise ValueError("max_x must be a positive integer")
+    if not isinstance(max_y, (int, np.integer)) or max_y <= 0:
+        raise ValueError("max_y must be a positive integer")
+
+    height, width = image.shape[:2]
+    crops = []
+    boxes = []
+    for ymin in range(0, height, int(max_y)):
+        ymax = min(ymin + int(max_y), height)
+        for xmin in range(0, width, int(max_x)):
+            xmax = min(xmin + int(max_x), width)
+            crops.append(image[ymin:ymax, xmin:xmax])
+            boxes.append((ymin, ymax, xmin, xmax))
+    return crops, boxes
 
 
 def load_model(model_path: Union[str, Path], num_classes: Optional[int] = None,
@@ -154,6 +202,10 @@ def load_model(model_path: Union[str, Path], num_classes: Optional[int] = None,
     # Allow explicit architecture hint from checkpoint if present
     if isinstance(checkpoint, dict) and "arch" in checkpoint:
         arch = str(checkpoint["arch"]).lower()
+
+    # Prefer the encoder recorded in the checkpoint (e.g. Optuna-tuned resnet50)
+    if isinstance(checkpoint, dict) and checkpoint.get("encoder"):
+        encoder_name = str(checkpoint["encoder"])
 
     # Create model architecture with detected/provided num_classes
     if arch in ("deeplabv3", "deeplab", "deeplab_v3"):
@@ -297,14 +349,65 @@ def predict_patch_based(model: torch.nn.Module, image: np.ndarray,
     return pred_mask, prob_map
 
 
+def predict_image_tiled(
+    model: torch.nn.Module,
+    image: np.ndarray,
+    max_crop_width: int = 3000,
+    max_crop_height: int = 1000,
+    device: str = 'cuda',
+    use_patch_based: bool = False,
+    tile_size: int = 512,
+    stride: Optional[int] = None,
+    batch_size: int = 4,
+    mean: np.ndarray = DEFAULT_MEAN,
+    std: np.ndarray = DEFAULT_STD,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Run independent inference on non-overlapping crops and stitch results."""
+    crops, boxes = tessellate_image(image, max_crop_width, max_crop_height)
+    height, width = image.shape[:2]
+    stitched_prob_map = None
+
+    for crop, (ymin, ymax, xmin, xmax) in zip(crops, boxes):
+        if use_patch_based:
+            _, tile_prob_map = predict_patch_based(
+                model, crop, device=device, tile_size=tile_size,
+                stride=stride, batch_size=batch_size, mean=mean, std=std,
+            )
+        else:
+            _, tile_prob_map = predict_full_image(
+                model, crop, device=device, mean=mean, std=std,
+            )
+
+        tile_height, tile_width = ymax - ymin, xmax - xmin
+        if tile_prob_map.shape[1:] != (tile_height, tile_width):
+            raise ValueError(
+                "Tile inference returned a probability map with shape "
+                f"{tile_prob_map.shape[1:]}, expected {(tile_height, tile_width)}"
+            )
+        if stitched_prob_map is None:
+            stitched_prob_map = np.zeros(
+                (tile_prob_map.shape[0], height, width), dtype=np.float32
+            )
+        elif stitched_prob_map.shape[0] != tile_prob_map.shape[0]:
+            raise ValueError("All tiles must produce the same number of classes")
+        stitched_prob_map[:, ymin:ymax, xmin:xmax] = tile_prob_map
+
+    pred_mask = np.argmax(stitched_prob_map, axis=0).astype(np.uint8)
+    return pred_mask, stitched_prob_map
+
+
 def predict_image(image_path: Union[str, Path], model_path: Union[str, Path],
                  output_path: Optional[Union[str, Path]] = None,
                  use_patch_based: bool = False, tile_size: int = 512,
                  stride: Optional[int] = None, batch_size: int = 4,
+                 use_tiled: bool = False, max_crop_width: int = 3000,
+                 max_crop_height: int = 1000,
                  num_classes: Optional[int] = None, encoder_name: str = 'resnet34',
                  device: str = 'cuda', return_probabilities: bool = False,
                  overlay_alpha: float = 0.5, save_output: bool = True,
-                 return_timing: bool = False) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
+                 return_timing: bool = False,
+                 confidence_thresholds: Optional[Mapping[int, float]] = None
+                 ) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
     """
     Main prediction function: load image and model, generate prediction mask.
     
@@ -313,6 +416,9 @@ def predict_image(image_path: Union[str, Path], model_path: Union[str, Path],
         model_path: Path to model checkpoint
         output_path: Optional path to save prediction mask
         use_patch_based: If True, use sliding window inference (for patch models)
+        use_tiled: If True, crop the original image before inference
+        max_crop_width: Maximum crop width for tiled inference
+        max_crop_height: Maximum crop height for tiled inference
         tile_size: Patch size for sliding window (only if use_patch_based=True)
         stride: Stride for sliding window (only if use_patch_based=True)
         batch_size: Batch size for patch processing (only if use_patch_based=True)
@@ -320,6 +426,7 @@ def predict_image(image_path: Union[str, Path], model_path: Union[str, Path],
         encoder_name: Encoder name (default: resnet34)
         device: Device to run inference on
         return_probabilities: If True, also return probability map
+        confidence_thresholds: Optional per-class minimum confidence percentages
         overlay_alpha: Transparency for overlay visualization (0.0 = transparent, 1.0 = opaque)
         save_output: If True, save prediction mask and overlay to disk
         return_timing: If True, also return inference time in milliseconds
@@ -341,7 +448,15 @@ def predict_image(image_path: Union[str, Path], model_path: Union[str, Path],
     
     # Run prediction (measure only the model inference part, not image/model loading)
     start_time = time.perf_counter()
-    if use_patch_based:
+    if use_tiled:
+        print("Using tiled inference")
+        pred_mask, prob_map = predict_image_tiled(
+            model, image, max_crop_width=max_crop_width,
+            max_crop_height=max_crop_height, device=device,
+            use_patch_based=use_patch_based, tile_size=tile_size,
+            stride=stride, batch_size=batch_size,
+        )
+    elif use_patch_based:
         print("Using patch-based inference (sliding window)")
         pred_mask, prob_map = predict_patch_based(
             model, image, device=device, tile_size=tile_size,
@@ -352,6 +467,10 @@ def predict_image(image_path: Union[str, Path], model_path: Union[str, Path],
         pred_mask, prob_map = predict_full_image(model, image, device=device)
     end_time = time.perf_counter()
     inference_time_ms = (end_time - start_time) * 1000.0
+
+    pred_mask = apply_confidence_threshold(
+        pred_mask, prob_map, confidence_thresholds
+    )
     
     print(f"Prediction complete. Mask shape: {pred_mask.shape}")
     print(f"Class distribution: {np.bincount(pred_mask.flatten())}")
@@ -417,14 +536,15 @@ def visualize_prediction(image: np.ndarray, pred_mask: np.ndarray,
     # Determine number of classes from mask
     num_classes = int(pred_mask.max() + 1)
     
-    # Color map for classes (RGB)
-    # Background (0) = transparent (not used in overlay)
-    # Class 1 = blue, Class 2 = red, Class 3 = yellow
+    # Color map for classes (RGB). Background (0) remains transparent.
     colors = np.array([
-        [0, 0, 0],        # Background (0) - not used, will be transparent
+        [0, 0, 0],        # Background (0) - transparent
         [0, 0, 255],      # Class 1 - blue
         [255, 0, 0],      # Class 2 - red
         [255, 255, 0],    # Class 3 - yellow
+        [0, 180, 0],      # Class 4 - green
+        [255, 0, 255],    # Class 5 - magenta
+        [0, 255, 255],    # Class 6 - cyan
     ], dtype=np.uint8)
     
     # Extend colors if we have more classes than defined
@@ -432,8 +552,8 @@ def visualize_prediction(image: np.ndarray, pred_mask: np.ndarray,
         # Generate additional colors
         import colorsys
         additional_colors = []
-        for i in range(len(colors), num_classes):
-            hue = (i - len(colors)) / max(1, num_classes - len(colors))
+        for i in range(num_classes - len(colors)):
+            hue = (i + 0.5) / (num_classes - len(colors))
             rgb = colorsys.hsv_to_rgb(hue, 0.8, 0.9)
             additional_colors.append([int(c * 255) for c in rgb])
         colors = np.vstack([colors, np.array(additional_colors, dtype=np.uint8)])
@@ -466,6 +586,12 @@ if __name__ == "__main__":
                        help='Path to save prediction mask (default: auto-generate timestamped filename in data/predictions/)')
     parser.add_argument('--patch-based', action='store_true', 
                        help='Use patch-based inference (sliding window)')
+    parser.add_argument('--tiled', action='store_true',
+                       help='Crop the original image before inference')
+    parser.add_argument('--max-crop-width', type=int, default=3000,
+                       help='Maximum crop width for tiled inference')
+    parser.add_argument('--max-crop-height', type=int, default=1000,
+                       help='Maximum crop height for tiled inference')
     parser.add_argument('--tile-size', type=int, default=512,
                        help='Tile size for patch-based inference')
     parser.add_argument('--stride', type=int, default=None,
@@ -491,6 +617,9 @@ if __name__ == "__main__":
         model_path=args.model,
         output_path=args.output,
         use_patch_based=args.patch_based,
+        use_tiled=args.tiled,
+        max_crop_width=args.max_crop_width,
+        max_crop_height=args.max_crop_height,
         tile_size=args.tile_size,
         stride=args.stride,
         batch_size=args.batch_size,

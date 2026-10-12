@@ -2,7 +2,8 @@
 Download the Oak Defect Detection dataset from Hugging Face into ``data/raw-data``.
 
 The Hub repo stores line-scan TIFFs under ``raw-data/`` in the same flat naming
-convention expected by ``prepare_dataset`` (``*_Col.tif``, ``*_Col_Bin_*.tif``).
+convention expected by ``prepare_dataset`` (``*_Col.tif`` plus class masks such
+as ``*_Col_<class>.tif``, ``*_Col_Bin_<class>.tif``, or ``*_Bin_Col_<class>.tif``).
 
 Dataset: https://huggingface.co/datasets/nrodgers98/Oak-Defect-Detection
 License: CC BY-NC 4.0 (see dataset card).

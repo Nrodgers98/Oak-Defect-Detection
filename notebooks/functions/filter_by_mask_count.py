@@ -2,11 +2,14 @@ import shutil
 from pathlib import Path
 from collections import defaultdict
 
+from functions.mask_filenames import parse_class_mask_filename
+
 
 def filter_classes_by_mask_count(source_folder: str = None, mask_threshold: int = 50, output_folder: str = None) -> dict:
     """
-    Copy color masks (_Col_Bin_) from classes with count >= threshold from raw-data into filtered-data,
-    along with their associated color images. Only processes color masks, excluding luminance masks (_Lum_Bin_).
+    Copy recognized color class masks from classes with count >= threshold
+    into filtered-data, along with their associated color images. Supports
+    ``_Col_<class>``, ``_Col_Bin_<class>``, and ``_Bin_Col_<class>`` masks.
     All files are copied to a flat structure (no subfolders) in filtered-data.
     
     Args:
@@ -41,32 +44,33 @@ def filter_classes_by_mask_count(source_folder: str = None, mask_threshold: int 
     else:
         output_folder = Path(output_folder)
     
-    # Create output folder
+    # This folder is a generated intermediate; reset it so a rerun cannot mix
+    # files from a previous raw dataset with the current filtered results.
+    source_resolved = source_path.resolve()
+    output_resolved = output_folder.resolve()
+    if (
+        source_resolved == output_resolved
+        or source_resolved in output_resolved.parents
+        or output_resolved in source_resolved.parents
+    ):
+        raise ValueError("source_folder and output_folder must not overlap")
+    if output_folder.exists():
+        shutil.rmtree(output_folder)
     output_folder.mkdir(parents=True, exist_ok=True)
     
-    def extract_timestamp(filename: str) -> str:
-        parts = filename.split("_")
-        if len(parts) < 2:
-            return ""
-        return parts[0] + "_" + parts[1]
-
     # Count masks by class
     masks_by_class = defaultdict(list)
-    images_by_timestamp = defaultdict(list)  # Track color images for syncing
+    images_by_stem = defaultdict(list)  # Track exact associated color images
     
     for file in source_path.glob("*.tif"):
         filename = file.name
         
-        # Extract timestamp (e.g., "1-29-26_3.28.48.206" from full filename)
-        timestamp = extract_timestamp(filename)
-        
-        if "_Col_Bin_" in filename and "_Lum_Bin_" not in filename:
-            # Extract class name from color mask files (exclude luminance masks)
-            class_name = filename.split("_Col_Bin_")[1].replace(".tif", "")
+        parsed_mask = parse_class_mask_filename(file)
+        if parsed_mask is not None:
+            _image_stem, class_name = parsed_mask
             masks_by_class[class_name].append(filename)
-        elif "_Col.tif" in filename:
-            # Track color images by timestamp
-            images_by_timestamp[timestamp].append(filename)
+        elif file.stem.endswith("_Col"):
+            images_by_stem[file.stem].append(filename)
     
     # Separate classes by mask count
     classes_to_move = {}
@@ -94,7 +98,7 @@ def filter_classes_by_mask_count(source_folder: str = None, mask_threshold: int 
     # Copy files from classes meeting threshold
     for class_name, files in classes_to_move.items():
         # Copy mask files and track timestamps
-        timestamps_to_copy = set()
+        image_stems_to_copy = set()
         for filename in files:
             src = source_path / filename
             dst = output_folder / filename
@@ -102,16 +106,15 @@ def filter_classes_by_mask_count(source_folder: str = None, mask_threshold: int 
                 shutil.copy2(str(src), str(dst))
                 files_moved[class_name] += 1
                 
-                # Extract timestamp for color image matching
-                timestamp = extract_timestamp(filename)
-                if timestamp:
-                    timestamps_to_copy.add(timestamp)
+                parsed_mask = parse_class_mask_filename(filename)
+                if parsed_mask is not None:
+                    image_stems_to_copy.add(parsed_mask[0])
             except Exception as e:
                 print(f"Error copying {filename}: {e}")
         
         # Copy associated color images
-        for timestamp in timestamps_to_copy:
-            for color_img in images_by_timestamp[timestamp]:
+        for image_stem in image_stems_to_copy:
+            for color_img in images_by_stem[image_stem]:
                 if color_img not in copied_images:
                     src = source_path / color_img
                     dst = output_folder / color_img
