@@ -19,3 +19,6 @@ notebooks/runs/
 *.engine
 *.db
 CLAUDE.md
+
+# Output notebooks from terminal runs
+*_run.ipynb
